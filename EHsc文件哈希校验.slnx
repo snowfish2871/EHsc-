@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="EHsc文件哈希校验/EHsc文件哈希校验.vcxproj" Id="912df755-4781-42c6-9743-cbe12c5f5a80" />
+</Solution>
