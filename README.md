@@ -1558,13 +1558,9 @@ OfflineFileHash.exe --compare "D:\A\file.bin" "D:\B\file.bin"
 
 本项目当前未指定正式开源许可证。
 
-如果计划公开发布，建议根据实际需求选择许可证，例如：
+暂定使用以下许可证：
 
 - MIT License；
-- Apache License 2.0；
-- BSD 2-Clause License；
-- BSD 3-Clause License；
-- GPL-3.0。
 
 在正式添加许可证之前，不建议直接将项目声明为某种开源许可证下的软件。
 
@@ -1572,7 +1568,7 @@ OfflineFileHash.exe --compare "D:\A\file.bin" "D:\B\file.bin"
 
 ## 总结
 
-`OfflineFileHash` 是一个面向 Windows 的本地文件校验工具，具有以下核心能力：
+`EHsc文件哈希校验` 是一个面向 Windows 的本地文件校验工具，具有以下核心能力：
 
 - 支持 CRC32、MD5、SHA-1、SHA-256、SHA-384、SHA-512；
 - 使用 C++17；
