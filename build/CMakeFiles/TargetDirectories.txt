@@ -1,0 +1,6 @@
+C:/Users/aVCHh/Documents/deepseek-harness/default-workspace/EHsc/build/CMakeFiles/EHsc.dir
+C:/Users/aVCHh/Documents/deepseek-harness/default-workspace/EHsc/build/CMakeFiles/edit_cache.dir
+C:/Users/aVCHh/Documents/deepseek-harness/default-workspace/EHsc/build/CMakeFiles/rebuild_cache.dir
+C:/Users/aVCHh/Documents/deepseek-harness/default-workspace/EHsc/build/CMakeFiles/list_install_components.dir
+C:/Users/aVCHh/Documents/deepseek-harness/default-workspace/EHsc/build/CMakeFiles/install.dir
+C:/Users/aVCHh/Documents/deepseek-harness/default-workspace/EHsc/build/CMakeFiles/install/local.dir
