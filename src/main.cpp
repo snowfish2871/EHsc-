@@ -1,12 +1,13 @@
 // ============================================================================
 //  EHsc · main.cpp
 //  程序入口、命令行参数解析、各子命令实现（hash / verify / compare / bench /
-//  selftest / algos / 交互式菜单）。
+//  watch / selftest / algos / config / 交互式菜单）。
 // ============================================================================
 #include "core.h"
 #include "hashes.h"
 #include "report.h"
 #include "ui.h"
+#include "watch.h"
 #include "win32_utils.h"
 
 #ifndef WIN32_LEAN_AND_MEAN
@@ -20,10 +21,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace ehsc {
@@ -155,14 +158,16 @@ void printUsage() {
     showBanner();
     std::cout <<
         "\n用法:\n"
-        "  ehsc                                  启动交互式菜单（推荐）\n"
-        "  ehsc hash <文件|文件夹...> [选项]      计算哈希，可多目标\n"
-        "  ehsc verify <清单文件> [选项]          校验清单（比对摘要/大小/缺失）\n"
-        "  ehsc compare <文件A> <文件B> [选项]    字节级比较，定位首个差异\n"
-        "  ehsc bench <文件> [选项]               各算法吞吐量对比\n"
-        "  ehsc selftest                          运行内置标准测试向量\n"
-        "  ehsc algos                             列出支持的算法\n"
-        "  ehsc pick [--dir]                      调用 Windows 选择器并输出路径\n"
+        "  EHsc.exe                                  启动交互式菜单（推荐）\n"
+        "  EHsc.exe hash <文件|文件夹...> [选项]      计算哈希，可多目标\n"
+        "  EHsc.exe verify <清单文件> [选项]          校验清单（比对摘要/大小/缺失）\n"
+        "  EHsc.exe compare <文件A> <文件B> [选项]    字节级比较，定位首个差异\n"
+        "  EHsc.exe bench <文件> [选项]               各算法吞吐量对比\n"
+        "  EHsc.exe watch <文件|文件夹...> [选项]     监听谁在读/写这些文件\n"
+        "  EHsc.exe selftest                          运行内置标准测试向量\n"
+        "  EHsc.exe algos                             列出支持的算法与安全性说明\n"
+        "  EHsc.exe config                            显示配置文件位置与状态\n"
+        "  EHsc.exe pick [--dir]                      调用 Windows 选择器并输出路径\n"
         "\n通用选项:\n"
         "  -a, --algo <列表>     算法，如 sha256,md5、all（默认 sha256）\n"
         "  -t, --threads <N>     线程数，0 = 自动（默认 CPU 核心数，最多 8）\n"
@@ -189,12 +194,32 @@ void printUsage() {
         "      --no-hash         不额外计算摘要，只做逐字节比较\n"
         "\nbench 选项:\n"
         "      --seconds <N>     每个算法的最短测试时长（默认 2 秒）\n"
+        "\nwatch 选项（监听谁读写了目标文件）:\n"
+        "      --watch <秒>      监听时长，0 = 一直监听到按 Q 停止（默认 30 秒）\n"
+        "      --pid <N>         只看这个进程号的访问\n"
+        "      --no-handles      关闭句柄采样（只剩文件变更通知，无需权限但看不到进程）\n"
+        "      --no-notify       关闭目录变更通知（只保留\"谁打开着文件\"）\n"
+        "      --include-self    连 EHsc 自己产生的事件也记录\n"
+        "      --max-records <N> 最多保留多少条记录（默认 20000）\n"
+        "      --elevate         直接请求管理员权限（弹 UAC），不询问\n"
+        "      --no-elevate      不提权、不询问，以当前权限监听\n"
+        "      -o/-f             把监听报告写成文件（txt | csv | json）\n"
+        "\n  启动时会主动询问是否以管理员身份重新运行：\n"
+        "    · 选 Y → 走正规 UAC 提权流程，在新窗口中以管理员权限执行监听（结果最完整）\n"
+        "    · 选 N → 以当前权限监听（只能归因当前用户可访问的进程）\n"
+        "    · 若 UAC 授权被拒绝 → 本次监听不执行，直接返回上一层\n"
+        "    · 无人应答时 30 秒后按 N 继续（可用 EHSC_ELEVATE_TIMEOUT 调整，0=一直等）\n"
         "\n示例:\n"
-        "  ehsc hash D:\\data\\a.iso -a sha256,md5\n"
-        "  ehsc hash D:\\data -o manifest.csv -f csv -a all\n"
-        "  ehsc verify manifest.csv --base D:\\data\n"
-        "  ehsc compare a.bin b.bin\n"
-        "  ehsc bench big.dat --seconds 3\n";
+        "  EHsc.exe hash D:\\data\\a.iso -a sha256,md5\n"
+        "  EHsc.exe hash D:\\data -o manifest.csv -f csv -a all\n"
+        "  EHsc.exe verify manifest.csv --base D:\\data\n"
+        "  EHsc.exe compare a.bin b.bin\n"
+        "  EHsc.exe bench big.dat --seconds 3\n"
+        "  EHsc.exe watch D:\\data\\config.ini --watch 60\n"
+        "  EHsc.exe watch D:\\share -o watch.json -f json --watch 120\n"
+        "\n说明: 想知道是【哪个进程】在读写文件，请以管理员身份运行（否则只能看到当前用户\n"
+        "      可访问的进程）。非管理员同样可以拿到文件变更时间线。\n"
+        "\n⚠ 安全提醒: CRC32 / MD5 / SHA-1 仅用于文件完整性检查，绝不可用于安全用途。\n";
 }
 
 }  // namespace
@@ -589,6 +614,327 @@ int cmdBench(const Config& cfg, const std::vector<std::wstring>& targets, double
     return 0;
 }
 
+// ====================================================== 文件访问监听命令 ====
+namespace {
+
+std::string describeAccessRecord(const AccessRecord& record) {
+    std::string line;
+    line += paint("[" + formatUnixTime(record.firstSeenMs / 1000) + "] ", Color::Gray);
+    const WatchOp op = record.op;
+    const Color color = (op == WatchOp::Write || op == WatchOp::ReadWrite)
+                            ? Color::Yellow
+                            : (op == WatchOp::Read ? Color::Green : Color::Gray);
+    line += paint(padToWidth(watchOpDisplay(op), 10), color);
+    line += paint(padToWidth(wideToUtf8(record.processName) + " (pid " +
+                                 std::to_string(record.pid) + ")",
+                             34),
+                  Color::Cyan);
+    line += wideToUtf8(record.filePath);
+    return line;
+}
+
+std::string describeChangeRecord(const ChangeRecord& record) {
+    std::string line;
+    line += paint("[" + formatUnixTime(record.timeMs / 1000) + "] ", Color::Gray);
+    line += paint(padToWidth(changeKindDisplay(record.kind), 10),
+                  record.kind == ChangeKind::Removed ? Color::Red : Color::Magenta);
+    line += wideToUtf8(record.path);
+    if (!record.newPath.empty()) line += "  ->  " + wideToUtf8(record.newPath);
+    return line;
+}
+
+}  // namespace
+
+// 提权询问的等待秒数：默认 30 秒，0 表示一直等；可用环境变量 EHSC_ELEVATE_TIMEOUT 调整
+int elevatePromptTimeoutSeconds() {
+    int seconds = 30;
+    wchar_t buffer[16] = {0};
+    const DWORD len = GetEnvironmentVariableW(L"EHSC_ELEVATE_TIMEOUT", buffer, 16);
+    if (len > 0 && len < 16) {
+        const int parsed = std::atoi(wideToUtf8(buffer).c_str());
+        if (parsed >= 0 && parsed <= 3600) seconds = parsed;
+    }
+    return seconds;
+}
+
+int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
+             const WatchRunOptions& options) {
+    if (targets.empty()) {
+        printError("没有指定要监听的文件或文件夹");
+        return 4;
+    }
+
+    // ---------------------------------------------------------- 提权询问 --
+    // 归因"是哪个进程"需要管理员权限才能看到系统进程与其他用户的句柄。
+    // 因此启动监听前主动问一次：选 Y 就走正规 UAC 提权流程（重启一个提权后的自己）；
+    // 用户在 UAC 对话框上拒绝时，本次监听不执行，直接返回上一层。
+    std::vector<std::wstring> resolvedTargets;
+    resolvedTargets.reserve(targets.size());
+    for (const std::wstring& raw : targets) {
+        const std::wstring full = fullPath(stripQuotes(raw));
+        resolvedTargets.push_back(full.empty() ? raw : full);
+    }
+
+    if (!isProcessElevated() && options.elevate != ElevateMode::Never) {
+        bool attempt = options.elevate == ElevateMode::Force;
+        if (options.elevate == ElevateMode::Ask) {
+            // 能问就问：控制台、管道里已有数据、或调用方确认这是交互流程（主菜单）。
+            // 注意：如果是"重绑之后才拿到控制台"，说明标准流本来是被重定向的 ——
+            // 那种情况（脚本、管道、计划任务）不能提问，否则会把调用方卡在提问上。
+            const bool genuineConsole = stdinIsConsole() && !consoleStreamsWereRebound();
+            const bool canAsk = options.interactivePrompt || genuineConsole ||
+                                stdinHasPendingInput();
+            if (canAsk) {
+                std::cout << "\n" << paint("⚠ 权限提示", Color::Yellow) << "\n";
+                std::cout << "  监听\"是哪个进程读写了文件\"需要管理员权限：只有提权后才能解析\n"
+                             "  系统进程、服务与其他用户的句柄。不提权也能运行，但归因结果会不完整。\n";
+                // 限时询问：无人应答（脚本、计划任务、走开了）时按"不提权"继续，
+                // 绝不把调用方永久卡在提问上。可用 --elevate / --no-elevate 直接表态。
+                const int timeout = elevatePromptTimeoutSeconds();
+                std::string question = "是否以管理员身份重新启动监听任务（会弹出 UAC 授权窗口）? (Y/N): ";
+                if (timeout > 0) {
+                    question = "是否以管理员身份重新启动监听任务（会弹出 UAC 授权窗口）? (Y/N，"
+                               + std::to_string(timeout) + " 秒内未选择则按 N 继续): ";
+                }
+                bool timedOut = false;
+                attempt = askYesNoTimed(question, false, timeout, &timedOut);
+                if (timedOut) {
+                    printInfo("等待超时，按\"不提权\"处理，使用当前权限继续");
+                } else if (!attempt) {
+                    printInfo("已选择不提权，使用当前权限继续（报告里会注明覆盖面限制）");
+                }
+            } else {
+                printWarning("标准输入没有可读内容，无法询问是否提权；将以当前权限运行"
+                             "（如需完整归因请加 --elevate 或直接以管理员身份运行）");
+            }
+        }
+
+        if (attempt) {
+            // 重新拼装命令行：同一个 exe + 同样的参数 + 提权子进程标记
+            std::wstring parameters;
+            auto append = [&parameters](const std::wstring& text) {
+                if (!parameters.empty()) parameters += L' ';
+                parameters += text;
+            };
+            append(L"watch");
+            for (const std::wstring& target : resolvedTargets) {
+                append(quoteCommandLineArgument(target));
+            }
+            append(L"--no-elevate");                                  // 子进程已提权，不再询问
+            append(L"--elevated-child");                              // 结束后暂停，便于查看结果
+            char number[64];
+            std::snprintf(number, sizeof(number), "%.3f", options.seconds);
+            append(L"--watch " + utf8ToWide(number));
+            if (!options.recursive) append(L"--no-recursive");
+            if (!options.pollHandles) append(L"--no-handles");
+            if (!options.notifyChanges) append(L"--no-notify");
+            if (options.includeSelf) append(L"--include-self");
+            if (options.onlyPid != 0) append(L"--pid " + std::to_wstring(options.onlyPid));
+            if (options.maxRecords != 20000) {
+                append(L"--max-records " + std::to_wstring(options.maxRecords));
+            }
+            if (options.quiet) append(L"--quiet");
+            if (options.pollHandles || options.notifyChanges) { /* 默认即为双通道 */ }
+            if (!options.output.empty()) {
+                append(L"-o " + quoteCommandLineArgument(fullPath(options.output)));
+                append(L"-f " + utf8ToWide(formatName(options.format)));
+            }
+            for (const std::wstring& filter : options.filters) {
+                append(L"--filter " + quoteCommandLineArgument(filter));
+            }
+
+            unsigned long elevateError = 0;
+            const ElevateStatus status = relaunchElevated(parameters, &elevateError);
+            if (status == ElevateStatus::Cancelled) {
+                std::cout << "\n";
+                printWarning("已取消管理员授权（UAC 被拒绝），本次监听未执行，返回上一层");
+                return 3;
+            }
+            if (status == ElevateStatus::Failed) {
+                std::cout << "\n";
+                printError("无法以管理员身份启动：" + pathText(formatWinError(elevateError)));
+                printInfo("本次监听未执行。如确实不想提权，可加 --no-elevate 以当前权限运行。");
+                return 4;
+            }
+            printSuccess("已在新窗口中启动管理员权限的监听任务（UAC 已通过）");
+            printInfo("该窗口会实时显示访问事件，结束后停留等待回车；本窗口等它跑完再返回");
+            const int childCode = waitForElevatedChild();
+            if (childCode >= 0) {
+                printInfo("管理员监听任务已结束（退出码 " + std::to_string(childCode) + "）");
+            }
+            return childCode >= 0 ? childCode : 0;
+        }
+    }
+
+    WatchOptions engine;
+    engine.recursive = options.recursive;
+    engine.pollHandles = options.pollHandles;
+    engine.notifyChanges = options.notifyChanges;
+    engine.includeSelf = options.includeSelf;
+    engine.onlyPid = options.onlyPid;
+    engine.seconds = options.seconds;
+    engine.maxRecords = options.maxRecords;
+    engine.filters = options.filters;
+    engine.pollIntervalMs = 400;
+
+    FileActivityMonitor monitor(resolvedTargets, engine);
+    std::wstring err;
+    if (!monitor.start(err)) {
+        printError("无法启动监听：" + pathText(err));
+        return 4;
+    }
+
+    const bool quietMode = options.quiet;
+    double watchSeconds = options.seconds;
+    if (watchSeconds <= 0 && !stdinIsConsole()) {
+        // 无时限监听要靠键盘 Q / Ctrl+C 停止；输入被重定向时这两条路都不通，
+        // 因此自动兜底成有限时长，避免留下一个停不掉的进程。
+        printWarning("无时限监听需要交互式控制台才能按 Q 停止；当前标准输入不是控制台，"
+                     "已自动限制为 60 秒（可用 --watch <秒> 指定时长）");
+        watchSeconds = 60.0;
+    }
+    printSectionTitle("文件访问监听");
+    printInfo("监听目标 : " + std::to_string(resolvedTargets.size()) + " 个路径");
+    for (const std::wstring& target : resolvedTargets) printInfo("           " + pathText(target));
+    printInfo(std::string("监听时长 : ") +
+              (watchSeconds > 0 ? formatDuration(watchSeconds) + "（到时可提前按 Q 停止）"
+                                   : std::string("直到按 Q / Ctrl+C 停止")));
+    printInfo(std::string("探测通道 : ") + (options.pollHandles ? "句柄采样" : "") +
+              (options.pollHandles && options.notifyChanges ? " + " : "") +
+              (options.notifyChanges ? "目录变更通知" : ""));
+    if (!monitor.stats().handleScanAvailable) {
+        printWarning("当前系统不支持句柄枚举，已退化为仅目录变更通知");
+    }
+    if (options.pollHandles && !monitor.stats().elevated) {
+        printWarning("未以管理员身份运行：只能归因当前用户可访问的进程；系统进程与其他用户"
+                     "的访问不会出现。需要完整结果请用管理员身份运行。");
+    }
+    printInfo("说明     : 句柄采样能指出\"谁打开着它（读/写）\"；目录变更能给出\"何时被改\"，"
+              "但 Windows 不提供变更发起者");
+
+    JobControl control;
+    setActiveJob(&control);
+    // 进度面板真正跑起来时由它轮询键盘；否则（--no-progress / --quiet / 输出被重定向 /
+    // 控制台句柄异常导致面板没能启动）必须由主循环自己轮询，否则"按 Q 停止"会失效。
+    ProgressMonitor progress(control, cfg.asciiBar, cfg.progress && !options.quiet,
+                             cfg.progressForce);
+    progress.setHint("[Q 或 Esc] 停止监听");
+
+    const int64_t startMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count();
+    control.beginRun(L"监听文件访问");
+    control.setTotals(1, static_cast<uint64_t>(std::max(1.0, watchSeconds) * 1000.0));
+    progress.start("文件访问监听");
+
+    size_t shownAccess = 0;
+    size_t shownChange = 0;
+    bool interrupted = false;
+    while (true) {
+        if (!control.checkpoint()) {
+            interrupted = true;
+            break;
+        }
+        // 面板没真正运行就自己响应键盘（面板在跑时由面板线程轮询，避免重复消费按键）
+        if (!progress.isActive()) {
+            const int key = pollKey();
+            if (key == 'q' || key == 'Q' || key == 27) {
+                interrupted = true;
+                break;
+            }
+        }
+        std::vector<AccessRecord> newAccess;
+        std::vector<ChangeRecord> newChange;
+        monitor.drain(newAccess, newChange);
+        // 只打印"首次出现"的访问记录（samples==1 即新记录），持续占用不再每轮刷屏，
+        // 完整明细在结束后的结果区统一给出。
+        for (const AccessRecord& record : newAccess) {
+            if (record.samples > 1) continue;
+            progress.log(describeAccessRecord(record));
+            ++shownAccess;
+        }
+        for (const ChangeRecord& record : newChange) {
+            progress.log(describeChangeRecord(record));
+            ++shownChange;
+        }
+
+        const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                  std::chrono::system_clock::now().time_since_epoch())
+                                  .count();
+        const double elapsed = static_cast<double>(nowMs - startMs) / 1000.0;
+        control.addBytes(250);   // 循环固定 250ms 一次，用来推进进度条
+        if (watchSeconds > 0 && elapsed >= watchSeconds) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
+    monitor.stop();
+    progress.stop();
+    control.endRun();
+    setActiveJob(nullptr);
+
+    if (interrupted) printWarning("监听被用户提前停止");
+
+    WatchResult result = monitor.snapshot();
+    result.elapsed = static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(
+                                             std::chrono::system_clock::now().time_since_epoch())
+                                             .count() -
+                                         startMs) /
+                     1000.0;
+    result.cancelled = interrupted;
+
+    printSectionTitle("监听结果");
+    std::cout << "  " << paint("权限说明 : ", Color::Gray) << pathText(result.stats.note) << "\n";
+    std::cout << "  句柄采样 : " << result.stats.samples << " 轮（最近一轮 "
+              << result.stats.handleScanMs << " ms，命中目标句柄 " << result.stats.handlesMatched
+              << " 个）\n";
+    std::cout << "  访问记录 : " << paint(std::to_string(result.accesses.size()), Color::Cyan)
+              << " 条（涉及 " << result.stats.processes << " 个进程 / " << result.stats.files
+              << " 个文件）\n";
+    std::cout << "  变更事件 : " << paint(std::to_string(result.changes.size()), Color::Magenta)
+              << " 条\n";
+    std::cout << "  监听时长 : " << formatDuration(result.elapsed) << "\n";
+    (void)quietMode;
+
+    if (!result.accesses.empty()) {
+        std::cout << "\n" << paint("── 进程访问明细 ──", Color::Bold) << "\n";
+        for (const AccessRecord& record : result.accesses) {
+            std::cout << "  " << describeAccessRecord(record);
+            if (!record.stillOpen) std::cout << paint("   [已关闭]", Color::Gray);
+            std::cout << "\n";
+        }
+    } else {
+        printWarning("监听期间没有观察到任何进程打开目标文件"
+                     "（瞬时打开可能短于采样间隔；系统进程需要管理员权限才能归因）");
+    }
+    if (!result.changes.empty()) {
+        std::cout << "\n" << paint("── 文件变更事件 ──", Color::Bold) << "\n";
+        for (const ChangeRecord& record : result.changes) {
+            std::cout << "  " << describeChangeRecord(record) << "\n";
+        }
+    }
+
+    int code = 0;
+    if (!options.output.empty()) {
+        const std::string text = buildWatchReport(result, options.format);
+        std::wstring writeErr;
+        if (writeFileUtf8(options.output, text, cfg.bom, writeErr)) {
+            printSuccess("已写入监听报告：" + pathText(fullPath(options.output)) + "（" +
+                         formatByteSize(text.size()) + "）");
+        } else {
+            printError("写入报告失败：" + pathText(writeErr));
+            code = 4;
+        }
+    }
+
+    // 提权后的子进程跑在自己的控制台窗口里：结束时停一下，别让结果一闪而过
+    if (options.pauseAtEnd && stdoutIsTerminal()) {
+        std::cout << "\n" << paint("按回车键关闭此窗口…", Color::Gray) << std::flush;
+        std::string line;
+        std::getline(std::cin, line);
+    }
+    return interrupted ? 3 : code;
+}
+
 // ========================================================== 参数解析 ====
 namespace {
 
@@ -619,6 +965,16 @@ struct ParsedArgs {
     bool quick = false;
     bool withHash = true;
     double seconds = 2.0;
+    bool   secondsSet = false;
+    // watch 专用
+    double   watchSeconds = 30.0;
+    uint32_t watchPid = 0;
+    size_t   watchMaxRecords = 20000;
+    bool     watchHandles = true;
+    bool     watchNotify = true;
+    bool     watchSelf = false;
+    ElevateMode watchElevate = ElevateMode::Ask;
+    bool     watchElevatedChild = false;
     bool help = false;
     bool version = false;
 };
@@ -711,6 +1067,17 @@ bool parseArgs(int argc, wchar_t** argv, ParsedArgs& out) {
             if (!nextValue(value)) return false;
             out.seconds = std::atof(wideToUtf8(value).c_str());
             if (out.seconds < 0.1) out.seconds = 0.1;
+            out.watchSeconds = out.seconds;
+            out.secondsSet = true;
+            continue;
+        }
+        if (lower == L"--watch") {
+            // --watch <秒>：监听时长（0 = 直到取消）
+            std::wstring value;
+            if (!nextValue(value)) return false;
+            out.watchSeconds = std::atof(wideToUtf8(value).c_str());
+            out.secondsSet = true;
+            if (out.watchSeconds < 0) out.watchSeconds = 0;
             continue;
         }
         if (lower == L"-r" || lower == L"--recursive") {
@@ -771,6 +1138,45 @@ bool parseArgs(int argc, wchar_t** argv, ParsedArgs& out) {
         }
         if (lower == L"--quick") {
             out.quick = true;
+            continue;
+        }
+        if (lower == L"--pid") {
+            std::wstring value;
+            if (!nextValue(value)) return false;
+            out.watchPid = static_cast<uint32_t>(std::strtoul(wideToUtf8(value).c_str(), nullptr, 10));
+            continue;
+        }
+        if (lower == L"--max-records") {
+            std::wstring value;
+            if (!nextValue(value)) return false;
+            out.watchMaxRecords =
+                static_cast<size_t>(std::strtoull(wideToUtf8(value).c_str(), nullptr, 10));
+            if (out.watchMaxRecords < 100) out.watchMaxRecords = 100;
+            continue;
+        }
+        if (lower == L"--no-handles") {
+            out.watchHandles = false;
+            continue;
+        }
+        if (lower == L"--no-notify") {
+            out.watchNotify = false;
+            continue;
+        }
+        if (lower == L"--include-self") {
+            out.watchSelf = true;
+            continue;
+        }
+        if (lower == L"--elevate") {
+            out.watchElevate = ElevateMode::Force;
+            continue;
+        }
+        if (lower == L"--no-elevate") {
+            out.watchElevate = ElevateMode::Never;
+            continue;
+        }
+        if (lower == L"--elevated-child") {
+            // 内部使用：提权后的子进程实例
+            out.watchElevatedChild = true;
             continue;
         }
         if (lower == L"--no-hash") {
@@ -887,11 +1293,58 @@ int runCommandLine(int argc, wchar_t** argv) {
         }
         return cmdBench(cfg, targets, args.seconds);
     }
+    if (command == "watch" || command == "monitor" || command == "w") {
+        std::vector<std::wstring> targets = args.positional;
+        if (targets.empty() && args.usePicker) {
+            const std::vector<std::wstring> picked =
+                pickFiles(L"请选择要监听的文件", true);
+            targets.insert(targets.end(), picked.begin(), picked.end());
+        }
+        if (targets.empty()) {
+            printError("请指定要监听的文件或文件夹，例如：EHsc.exe watch D:\\data --watch 60");
+            return 4;
+        }
+        WatchRunOptions watch;
+        watch.seconds = args.watchSeconds;
+        watch.recursive = args.recursive;
+        watch.pollHandles = args.watchHandles;
+        watch.notifyChanges = args.watchNotify;
+        watch.includeSelf = args.watchSelf;
+        watch.onlyPid = args.watchPid;
+        watch.maxRecords = args.watchMaxRecords;
+        watch.filters = parseFilters(cfg.filters);
+        watch.output = args.output;
+        watch.format = args.format;
+        watch.quiet = args.quiet;
+        watch.elevate = args.watchElevate;
+        watch.elevatedChild = args.watchElevatedChild;
+        watch.pauseAtEnd = args.watchElevatedChild;
+        return cmdWatch(cfg, targets, watch);
+    }
     if (command == "selftest" || command == "test") {
         return cmdSelfTest(true);
     }
     if (command == "algos" || command == "algorithms" || command == "list") {
         return cmdListAlgos();
+    }
+    if (command == "config" || command == "cfg" || command == "settings") {
+        const std::wstring path = configFilePath();
+        FileInfo info;
+        std::wstring err;
+        const bool exists = getFileInfo(path, info, err);
+        std::cout << "配置文件 : " << pathText(path) << "\n";
+        if (exists) {
+            std::cout << "状态     : 已存在（" << formatByteSize(info.size) << "）"
+                      << ((info.attributes & FileAttrHidden) ? "，隐藏属性已设置" : "，未隐藏")
+                      << "\n";
+            std::cout << "查看方法 : 资源管理器勾选「显示隐藏的项目」，或执行 attrib -h \""
+                      << pathText(path) << "\" 后直接编辑\n";
+        } else {
+            std::cout << "状态     : 尚未创建（首次进入交互式菜单时会自动生成，并设为隐藏）\n";
+        }
+        std::cout << "查找顺序 : " << pathText(configSearchDescription()) << "\n";
+        std::cout << "说明     : 删除配置文件不影响任何哈希功能，程序会按默认值重新生成。\n";
+        return 0;
     }
     if (command == "pick" || command == "select") {
         std::vector<std::wstring> picked;
@@ -914,6 +1367,13 @@ int runCommandLine(int argc, wchar_t** argv) {
 
 // ================================================================ 入口 ====
 int main() {
+    // 先把自己的标准流接回本进程的控制台：UAC 提权启动的新进程可能继承了
+    // 父进程（中完整性级别）的控制台句柄，那种句柄既打印不出东西、也读不到按键。
+    if (ehsc::rebindConsoleStreams()) {
+        std::cerr << "[EHsc] 检测到标准流未连接到本进程的控制台（提权启动时常见），已自动重新连接。"
+                  << "当前状态: 输出=" << (ehsc::stdoutIsTerminal() ? "终端窗口" : "重定向/不可用")
+                  << "，输入=" << (ehsc::stdinIsConsole() ? "控制台" : "重定向/不可用") << "\n";
+    }
     ehsc::setupConsoleUtf8();
 
     static ehsc::Config fallbackConfig;

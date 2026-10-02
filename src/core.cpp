@@ -995,4 +995,52 @@ std::wstring stripQuotes(const std::wstring& text) {
     return out;
 }
 
+size_t textDisplayWidth(const std::string& utf8Text) {
+    size_t width = 0;
+    for (size_t i = 0; i < utf8Text.size();) {
+        const unsigned char c = static_cast<unsigned char>(utf8Text[i]);
+        uint32_t code = 0;
+        int length = 1;
+        if (c < 0x80) {
+            code = c;
+        } else if ((c >> 5) == 0x6) {
+            code = c & 0x1Fu;
+            length = 2;
+        } else if ((c >> 4) == 0xE) {
+            code = c & 0x0Fu;
+            length = 3;
+        } else if ((c >> 3) == 0x1E) {
+            code = c & 0x07u;
+            length = 4;
+        } else {
+            ++i;
+            continue;
+        }
+        for (int k = 1; k < length && i + static_cast<size_t>(k) < utf8Text.size(); ++k) {
+            code = (code << 6) |
+                   (static_cast<unsigned char>(utf8Text[i + static_cast<size_t>(k)]) & 0x3Fu);
+        }
+        i += static_cast<size_t>(length);
+        const bool wide =
+            (code >= 0x1100 && code <= 0x115F) || code == 0x2329 || code == 0x232A ||
+            (code >= 0x2E80 && code <= 0xA4CF && code != 0x303F) ||
+            (code >= 0xAC00 && code <= 0xD7A3) || (code >= 0xF900 && code <= 0xFAFF) ||
+            (code >= 0xFE30 && code <= 0xFE6F) || (code >= 0xFF00 && code <= 0xFF60) ||
+            (code >= 0xFFE0 && code <= 0xFFE6) || (code >= 0x1F300 && code <= 0x1FAFF) ||
+            (code >= 0x20000 && code <= 0x3FFFD);
+        width += wide ? 2 : 1;
+    }
+    return width;
+}
+
+std::string padToWidth(const std::string& utf8Text, size_t width) {
+    std::string out = utf8Text;
+    size_t current = textDisplayWidth(out);
+    while (current < width) {
+        out.push_back(' ');
+        ++current;
+    }
+    return out;
+}
+
 }  // namespace ehsc

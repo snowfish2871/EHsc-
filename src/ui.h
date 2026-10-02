@@ -37,8 +37,14 @@ struct Config {
 };
 
 std::wstring configFilePath();
+// 配置文件的实际状态（供界面与 config 子命令显示）
+bool configFileExists();
+bool configFileIsHidden();
+std::wstring configSearchDescription();
 bool loadConfig(Config& cfg);
 bool saveConfig(const Config& cfg);
+// 首次运行时创建默认配置文件（写入隐藏属性）；已存在则直接返回 true
+bool ensureConfigExists(const Config& cfg);
 std::vector<std::wstring> parseFilters(const std::wstring& text);
 size_t bufferBytes(const Config& cfg);
 
@@ -61,6 +67,32 @@ void printError(const std::string& text);
 bool readLineUtf8(const std::string& prompt, std::string& line);
 int askInt(const std::string& prompt, int low, int high, int defaultValue);
 bool askYesNo(const std::string& prompt, bool defaultValue);
+// 带超时的询问：超时（无人应答）时返回默认值并置 timedOut。
+// 交互式控制台上用键盘轮询实现，因此脚本/无人值守场景不会被永久卡住。
+bool askYesNoTimed(const std::string& prompt, bool defaultValue, int timeoutSeconds,
+                   bool* timedOut);
+
+// ------------------------------------------------- 可点击菜单（鼠标） ----
+// 把"控制台缓冲区里的某一行（可再限定列范围）"登记为可点击区域，
+// 之后 askMenuChoice 会同时接受键盘输入与鼠标点击。
+void clickableClear();
+int  clickableRow();       // 打印条目前调用：拿到这一行会落在哪个缓冲区行
+int  clickableColumn();    // 同上，列号（用于同一行内的多个可点击选项）
+// 登记整行为可点击；label 是该行的可见文本（用于点击时按内容核对，
+// 这样即使控制台缓冲区滚动导致行号变化也不会点错条目）
+void clickableAddRow(int row, int value, const std::string& label);
+// 登记行内某个文字片段为可点击；token 必须与屏幕上显示的原文一致
+void clickableAddSpan(int row, int colBegin, int colEnd, int value, const std::string& token);
+bool clickableAvailable(); // 当前环境是否支持鼠标点击
+void printClickHint();     // 打印"可以直接点击"的提示（不支持时什么都不打印）
+
+// 读一个菜单选项：键盘输入数字 + 回车，或鼠标点击已登记的条目。
+// 返回选中的值；按 Esc / 直接回车返回 defaultValue。
+int askMenuChoice(const std::string& prompt, int low, int high, int defaultValue);
+
+// 一行式选项菜单（例如"清单格式 1) 文本 2) CSV 3) JSON"），每个选项都可点击。
+int askOptionRow(const std::string& title,
+                 const std::vector<std::pair<int, std::string>>& options, int defaultValue);
 void pauseForEnter(const std::string& hint = "按回车键返回主菜单…");
 // 输入路径；允许分号分隔多个；输入为空时调用 Windows 原生选择器
 std::vector<std::wstring> askTargets(const std::string& prompt, bool multiple, bool folderMode);
@@ -80,6 +112,9 @@ public:
 
     void start(const std::string& title);
     void stop();
+    // 面板是否真的在运行（enabled 且已 start）。调用方据此决定要不要自己轮询键盘：
+    // 面板没跑起来时（重定向、--no-progress、UAC 新控制台句柄异常等）必须由主循环接管按键。
+    bool isActive() const { return enabled_ && running_.load(); }
     // 在进度面板上方打印一行日志（线程安全）
     void log(const std::string& line);
     // 设置附加状态文本（显示在面板底部）
@@ -121,5 +156,36 @@ int cmdVerify(const Config& cfg, const std::wstring& manifestPath, const std::ws
 int cmdCompare(const Config& cfg, const std::wstring& pathA, const std::wstring& pathB, bool quick,
                bool withHash);
 int cmdBench(const Config& cfg, const std::vector<std::wstring>& targets, double minSeconds);
+
+// 文件访问监听：把 watch 引擎的结果实时显示出来（实现在 main.cpp）
+enum class ElevateMode {
+    Ask,     // 未提权时主动询问是否以管理员身份重启（默认）
+    Force,   // 直接走 UAC 提权流程，不询问
+    Never,   // 保持当前权限，绝不询问/提权
+};
+
+struct WatchRunOptions {
+    double                    seconds = 30.0;
+    bool                      recursive = true;
+    bool                      pollHandles = true;
+    bool                      notifyChanges = true;
+    bool                      includeSelf = false;
+    uint32_t                  onlyPid = 0;
+    size_t                    maxRecords = 20000;
+    std::wstring              output;      // 报告输出路径（空 = 不写文件）
+    OutFormat                 format = OutFormat::Text;
+    std::vector<std::wstring> filters;
+    bool                      quiet = false;
+    ElevateMode               elevate = ElevateMode::Ask;
+    // 交互式流程（主菜单）里即使用户输入暂时不在缓冲区，也照常提问 ——
+    // 菜单本来就在等用户输入，多问一句不会改变阻塞语义。
+    bool                      interactivePrompt = false;
+    // 由提权后的子进程使用：跑完后暂停，等用户看完结果再关闭窗口
+    bool                      pauseAtEnd = false;
+    // 由提权后的子进程使用：不再次询问提权
+    bool                      elevatedChild = false;
+};
+int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
+             const WatchRunOptions& options);
 
 }  // namespace ehsc

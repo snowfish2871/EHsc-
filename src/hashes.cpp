@@ -1307,7 +1307,7 @@ const char* versionString() {
 #ifdef EHSC_VERSION
     return EHSC_VERSION;   // 由 CMake 注入（CMakeLists.txt 中的 EHSC_VERSION_STRING）
 #else
-    return "2.0.0bate";    // 直接用 cl.exe 编译时的回退值
+    return "2.1.1";   // 直接用 cl.exe 编译时的回退值
 #endif
 }
 

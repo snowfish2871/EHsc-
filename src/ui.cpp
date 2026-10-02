@@ -12,6 +12,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <thread>
 #include <iostream>
 #include <sstream>
 
@@ -251,28 +252,327 @@ int askInt(const std::string& prompt, int low, int high, int defaultValue) {
     return defaultValue;
 }
 
+namespace {
+// 把用户输入解析为"是/否"，无法识别时返回默认值
+bool interpretYesNo(const std::string& text, bool defaultValue) {
+    std::string lower = text;
+    for (char& c : lower) {
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    }
+    while (!lower.empty() && (lower.front() == ' ' || lower.front() == '\t')) lower.erase(lower.begin());
+    while (!lower.empty() &&
+           (lower.back() == ' ' || lower.back() == '\r' || lower.back() == '\n' || lower.back() == '\t')) {
+        lower.pop_back();
+    }
+    if (lower.empty()) return defaultValue;
+    if (lower == "y" || lower == "yes" || lower == "1" || lower == "是" || lower == "好") return true;
+    if (lower == "n" || lower == "no" || lower == "0" || lower == "否" || lower == "不") return false;
+    return defaultValue;
+}
+
+namespace {
+// 调试用：把点击相关的诊断写到文件（不能用 stderr，否则调试输出本身会占用控制台行、
+// 让行号发生偏移，反而干扰诊断）
+void clickDebugLog(const std::string& text) {
+    const char* path = std::getenv("EHSC_DEBUG_CLICK");
+    if (path == nullptr || *path == '\0') return;
+    std::ofstream out(path, std::ios::app);
+    if (!out) return;
+    out << text << "\n";
+}
+}  // namespace
+// ------------------------------------------------------- 可点击区域 ----
+struct ClickRegion {
+    int row = 0;
+    int colBegin = -1;   // < 0 表示整行可点
+    int colEnd = -1;
+    int value = 0;
+    std::string label;   // 整行登记 = 该行可见文本；span 登记 = 屏幕上的原文片段
+};
+
+std::mutex g_clickMutex;
+std::vector<ClickRegion> g_clickRegions;
+constexpr int kNoClickValue = -1000000;
+
+// 去掉左侧空白，便于按内容匹配
+std::string trimLeft(const std::string& text) {
+    size_t begin = 0;
+    while (begin < text.size() && (text[begin] == ' ' || text[begin] == '\t')) ++begin;
+    return text.substr(begin);
+}
+
+// 取"条目关键字"：标题部分（第一个连续两个空格之前的内容）。
+// 这样条目后面的当前值变了（例如 进度条 开 → 关）仍然匹配得上。
+std::string clickLabelKey(const std::string& label) {
+    const std::string text = trimLeft(label);
+    const size_t gap = text.find("  ");
+    return gap == std::string::npos ? text : text.substr(0, gap);
+}
+
+int lookupClick(int row, int column) {
+    // 先读出被点击那一行"实际显示的内容"：控制台缓冲区可能已经滚动，
+    // 只靠登记时的行号会点错条目（行号会全部挤在缓冲区最后一行），所以以屏幕文字为准。
+    const std::string line = consoleLineText(row);
+    const std::string trimmed = trimLeft(line);
+    clickDebugLog("[dbg] lookup row=" + std::to_string(row) + " col=" + std::to_string(column) +
+                  " line=[" + trimmed + "]");
+
+    std::lock_guard<std::mutex> lock(g_clickMutex);
+    if (!trimmed.empty()) {
+        // ① 整行条目：该行以条目关键字开头
+        for (const ClickRegion& region : g_clickRegions) {
+            if (region.colBegin >= 0 || region.label.empty()) continue;
+            const std::string key = clickLabelKey(region.label);
+            if (!key.empty() && trimmed.rfind(key, 0) == 0) {
+                clickDebugLog("[dbg]   matched row-region value=" + std::to_string(region.value));
+                return region.value;
+            }
+        }
+        // ② 行内片段：点击列落在这个片段上
+        for (const ClickRegion& region : g_clickRegions) {
+            if (region.colBegin < 0 || region.label.empty()) continue;
+            const size_t at = line.find(region.label);
+            if (at == std::string::npos) continue;
+            const int begin = static_cast<int>(textDisplayWidth(line.substr(0, at)));
+            const int end = begin + static_cast<int>(textDisplayWidth(region.label)) - 1;
+            if (column >= begin && column <= end) return region.value;
+        }
+    }
+    // ③ 兜底：按登记时的行号/列范围（屏幕文字读不到时）
+    for (const ClickRegion& region : g_clickRegions) {
+        if (region.row != row || region.colBegin < 0) continue;
+        if (column >= region.colBegin && column <= region.colEnd) return region.value;
+    }
+    for (const ClickRegion& region : g_clickRegions) {
+        if (region.row == row && region.colBegin < 0) return region.value;
+    }
+    return kNoClickValue;
+}
+
+// 在提示文本里找到 token 所在的列范围（用于把 "Y" / "N" 变成可点击）
+bool findTokenColumns(const std::string& text, const std::string& token, int startColumn,
+                      int& colBegin, int& colEnd) {
+    const size_t pos = text.find(token);
+    if (pos == std::string::npos) return false;
+    colBegin = startColumn + static_cast<int>(textDisplayWidth(text.substr(0, pos)));
+    colEnd = colBegin + static_cast<int>(textDisplayWidth(token)) - 1;
+    return true;
+}
+}  // namespace
+
+void clickableClear() {
+    std::lock_guard<std::mutex> lock(g_clickMutex);
+    g_clickRegions.clear();
+}
+
+int clickableRow() { return consoleCursorRow(); }
+int clickableColumn() { return consoleCursorColumn(); }
+
+
+void clickableAddRow(int row, int value, const std::string& label) {
+    if (row < 0) return;
+    clickDebugLog("[dbg] register row=" + std::to_string(row) + " value=" + std::to_string(value) +
+                  " label=" + trimLeft(label));
+    std::lock_guard<std::mutex> lock(g_clickMutex);
+    g_clickRegions.push_back(ClickRegion{row, -1, -1, value, label});
+}
+
+void clickableAddSpan(int row, int colBegin, int colEnd, int value, const std::string& token) {
+    if (row < 0 || colEnd < colBegin) return;
+    clickDebugLog("[dbg] register span row=" + std::to_string(row) + " value=" +
+                  std::to_string(value) + " token=" + token);
+    std::lock_guard<std::mutex> lock(g_clickMutex);
+    g_clickRegions.push_back(ClickRegion{row, colBegin, colEnd, value, token});
+}
+
+bool clickableAvailable() { return consoleMouseAvailable(); }
+
+void printClickHint() {
+    if (!clickableAvailable()) return;
+    std::cout << paint("  （提示：可以直接用鼠标点击上面的条目选择）", Color::Gray) << "\n";
+}
+
+int askMenuChoice(const std::string& prompt, int low, int high, int defaultValue) {
+    if (!prompt.empty()) std::cout << prompt << std::flush;
+    if (!clickableAvailable()) {
+        // 没有鼠标支持时退回原来的行输入行为（脚本/管道走这条路径），
+        // 输入非法就再问一次；读到 EOF 时按默认值返回，不会卡住调用方。
+        for (;;) {
+            std::string line;
+            if (!readLineUtf8("", line)) return defaultValue;
+            if (line.empty()) return defaultValue;
+            const int value = std::atoi(line.c_str());
+            if (value >= low && value <= high) return value;
+            std::cout << paint("  输入无效，请重新选择: ", Color::Yellow) << std::flush;
+        }
+    }
+
+    std::string typed;
+    for (;;) {
+        const ConsoleEvent event = pollConsoleEvent();
+        if (event.kind == ConsoleEventKind::Key) {
+            const int key = event.key;
+            if (key == '\r' || key == '\n') {
+                std::cout << "\n";
+                if (typed.empty()) return defaultValue;
+                const int value = std::atoi(typed.c_str());
+                if (value >= low && value <= high) return value;
+                std::cout << paint("  输入无效，请重新选择: ", Color::Yellow) << std::flush;
+                typed.clear();
+                continue;
+            }
+            if (key == 27) {   // Esc = 返回上一层
+                std::cout << "\n";
+                return defaultValue;
+            }
+            if (key == 8 || key == 127) {
+                if (!typed.empty()) {
+                    typed.pop_back();
+                    std::cout << "\b \b" << std::flush;
+                }
+                continue;
+            }
+            if (key >= '0' && key <= '9') {
+                typed.push_back(static_cast<char>(key));
+                std::cout << static_cast<char>(key) << std::flush;
+            }
+            continue;
+        }
+        if (event.kind == ConsoleEventKind::MouseClick) {
+            const int value = lookupClick(event.row, event.column);
+            clickDebugLog("[dbg] click row=" + std::to_string(event.row) + " col=" +
+                          std::to_string(event.column) + " -> value=" + std::to_string(value));
+            if (value != kNoClickValue) {
+                std::cout << value << "\n";
+                return value;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+}
+
+int askOptionRow(const std::string& title,
+                 const std::vector<std::pair<int, std::string>>& options, int defaultValue) {
+    if (options.empty()) return defaultValue;
+
+    clickableClear();
+    const int row = clickableRow();
+    const int startColumn = clickableColumn();
+    if (row < 0 || startColumn < 0) {   // 没有控制台：退回普通提问
+        std::string line = title + "  ";
+        for (const auto& option : options) {
+            line += std::to_string(option.first) + ") " + option.second + "  ";
+        }
+        const int value = askInt(line + ": ", options.front().first, options.back().first,
+                                 defaultValue);
+        return value;
+    }
+
+    std::string line = title + "  ";
+    std::vector<std::pair<int, int>> spans;
+    spans.reserve(options.size());
+    for (const auto& option : options) {
+        const std::string text = std::to_string(option.first) + ") " + option.second;
+        const int begin = startColumn + static_cast<int>(textDisplayWidth(line));
+        line += text;
+        const int end = startColumn + static_cast<int>(textDisplayWidth(line)) - 1;
+        spans.emplace_back(begin, end);
+        line += "   ";
+    }
+    for (size_t i = 0; i < options.size(); ++i) {
+        clickableAddSpan(row, spans[i].first, spans[i].second, options[i].first,
+                         std::to_string(options[i].first) + ") " + options[i].second);
+    }
+    if (clickableAvailable()) line += "（可点击）";
+    const int low = options.front().first;
+    const int high = options.back().first;
+    return askMenuChoice(line + ": ", low, high, defaultValue);
+}
+
 bool askYesNo(const std::string& prompt, bool defaultValue) {
     std::string line;
     if (!readLineUtf8(prompt, line)) return defaultValue;
-    if (line.empty()) return defaultValue;
-    const std::string lower = [&] {
-        std::string t = line;
-        for (char& c : t) {
-            if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return interpretYesNo(line, defaultValue);
+}
+
+bool askYesNoTimed(const std::string& prompt, bool defaultValue, int timeoutSeconds,
+                   bool* timedOut) {
+    if (timedOut != nullptr) *timedOut = false;
+    // 非控制台（管道/文件）不在键盘上等：要么数据已经就绪，要么根本没人会回答
+    if (!stdinIsConsole()) return askYesNo(prompt, defaultValue);
+
+    // 把 "(Y/N" 里的 Y 和 N 变成可点击区域
+    clickableClear();
+    const int startColumn = clickableColumn();
+    int yesBegin = 0, yesEnd = 0, noBegin = 0, noEnd = 0;
+    const bool yesClickable = findTokenColumns(prompt, "(Y", startColumn, yesBegin, yesEnd);
+    const bool noClickable = findTokenColumns(prompt, "/N", startColumn, noBegin, noEnd);
+
+    std::cout << prompt << std::flush;
+    if (yesClickable) clickableAddSpan(clickableRow(), yesBegin + 1, yesEnd, 1, "(Y");
+    if (noClickable) clickableAddSpan(clickableRow(), noBegin + 1, noEnd, 0, "/N");
+
+    std::string typed;
+    const auto timeoutMs = std::chrono::milliseconds(timeoutSeconds > 0 ? timeoutSeconds * 1000 : 0);
+    const auto deadline = std::chrono::steady_clock::now() + timeoutMs;
+    while (true) {
+        const ConsoleEvent event = pollConsoleEvent();
+        if (event.kind == ConsoleEventKind::MouseClick) {
+            const int value = lookupClick(event.row, event.column);
+            if (value == 1 || value == 0) {
+                std::cout << (value == 1 ? "Y" : "N") << "\n";
+                return value == 1;
+            }
         }
-        return t;
-    }();
-    if (lower == "y" || lower == "yes" || lower == "1" || lower == "是" || lower == "好")
-        return true;
-    if (lower == "n" || lower == "no" || lower == "0" || lower == "否" || lower == "不")
-        return false;
-    return defaultValue;
+        const int key = event.kind == ConsoleEventKind::Key ? event.key : -1;
+        if (key == '\r' || key == '\n') {
+            std::cout << "\n";
+            return interpretYesNo(typed, defaultValue);
+        }
+        if (key == 27) {   // Esc：放弃提权
+            std::cout << "\n";
+            return false;
+        }
+        if (key == 8 || key == 127) {   // 退格
+            if (!typed.empty()) {
+                typed.pop_back();
+                std::cout << "\b \b" << std::flush;
+            }
+        } else if (key >= 32 && key < 127) {
+            typed.push_back(static_cast<char>(key));
+            std::cout << static_cast<char>(key) << std::flush;   // ReadConsoleInput 不回显，手动回显
+        }
+        if (timeoutMs.count() > 0 && std::chrono::steady_clock::now() >= deadline) {
+            if (timedOut != nullptr) *timedOut = true;
+            std::cout << "\n";
+            return defaultValue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
 }
 
 void pauseForEnter(const std::string& hint) {
     std::cout << "\n" << paint(hint, Color::Gray) << std::flush;
-    std::string line;
-    std::getline(std::cin, line);
+
+    // 支持鼠标：点击提示行本身也可继续（非交互式输入仍走原来的读行逻辑，脚本不受影响）
+    if (!clickableAvailable()) {
+        std::string line;
+        std::getline(std::cin, line);
+        return;
+    }
+    clickableClear();
+    clickableAddRow(clickableRow(), 1, hint);
+    for (;;) {
+        const ConsoleEvent event = pollConsoleEvent();
+        if (event.kind == ConsoleEventKind::Key) {
+            if (event.key == '\r' || event.key == '\n' || event.key == 27 || event.key == ' ') break;
+        } else if (event.kind == ConsoleEventKind::MouseClick) {
+            if (lookupClick(event.row, event.column) != kNoClickValue) break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+    clickableClear();
+    std::cout << "\n";
 }
 
 std::vector<std::wstring> askTargets(const std::string& prompt, bool multiple, bool folderMode) {
@@ -315,8 +615,6 @@ std::wstring askSavePath(const std::string& prompt, const std::wstring& defaultN
 }
 
 // ============================================================ 配置持久化 ====
-std::wstring configFilePath() { return joinPath(executableDirectory(), L"ehsc.ini"); }
-
 std::vector<std::wstring> parseFilters(const std::wstring& text) {
     std::vector<std::wstring> filters;
     std::wstring current;
@@ -341,59 +639,37 @@ size_t bufferBytes(const Config& cfg) {
     return mb << 20;
 }
 
-bool loadConfig(Config& cfg) {
-    std::string text;
-    std::wstring err;
-    if (!readFileUtf8(configFilePath(), text, err)) return false;
-    std::istringstream stream(text);
-    std::string line;
-    while (std::getline(stream, line)) {
-        line = trimText(line);
-        if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
-        const size_t eq = line.find('=');
-        if (eq == std::string::npos) continue;
-        const std::string key = trimText(line.substr(0, eq));
-        const std::string value = trimText(line.substr(eq + 1));
-        if (key == "algos") {
-            std::string bad;
-            const std::vector<Algo> parsed = parseAlgoList(value, &bad);
-            if (!parsed.empty()) cfg.algos = parsed;
-        } else if (key == "threads") {
-            cfg.threads = std::atoi(value.c_str());
-        } else if (key == "bufferMB") {
-            const int mb = std::atoi(value.c_str());
-            if (mb >= 1 && mb <= 256) cfg.bufferMB = static_cast<size_t>(mb);
-        } else if (key == "format") {
-            OutFormat format{};
-            if (parseFormat(value, format)) cfg.format = format;
-        } else if (key == "progress") {
-            cfg.progress = (value != "0");
-        } else if (key == "ascii") {
-            cfg.asciiBar = (value != "0");
-        } else if (key == "overlap") {
-            cfg.overlap = (value != "0");
-        } else if (key == "recursive") {
-            cfg.recursive = (value != "0");
-        } else if (key == "hidden") {
-            cfg.includeHidden = (value != "0");
-        } else if (key == "checksize") {
-            cfg.verifyCheckSize = (value != "0");
-        } else if (key == "bom") {
-            cfg.bom = (value != "0");
-        } else if (key == "colors") {
-            cfg.colors = (value != "0");
-        } else if (key == "filters") {
-            cfg.filters = utf8ToWide(value);
-        } else if (key == "lastdir") {
-            cfg.lastDirectory = utf8ToWide(value);
-        }
-    }
-    return true;
+namespace {
+
+// 配置文件按顺序尝试的位置：
+//   1) 可执行文件所在目录（绿色/便携模式，首选）
+//   2) %APPDATA%\EHsc\ehsc.ini（exe 目录只读时，例如放在只读共享或光盘上）
+//   3) %TEMP%\EHsc\ehsc.ini（最后的兜底）
+// 这样即使把 EHsc.exe 单独拷到任意目录（甚至只读介质），程序依然可以正常保存设置。
+std::wstring g_activeConfigPath;
+
+const std::vector<std::wstring>& configCandidates() {
+    static const std::vector<std::wstring> list = [] {
+        std::vector<std::wstring> out;
+        const std::wstring exeDir = executableDirectory();
+        if (!exeDir.empty()) out.push_back(joinPath(exeDir, L"ehsc.ini"));
+        const std::wstring roaming = roamingAppDataDirectory();
+        if (!roaming.empty()) out.push_back(joinPath(joinPath(roaming, L"EHsc"), L"ehsc.ini"));
+        const std::wstring temp = tempDirectory();
+        if (!temp.empty()) out.push_back(joinPath(joinPath(temp, L"EHsc"), L"ehsc.ini"));
+        if (out.empty()) out.push_back(L"ehsc.ini");
+        return out;
+    }();
+    return list;
 }
 
-bool saveConfig(const Config& cfg) {
+// 配置文件文本：第一行是彩蛋，其余为可读可改的键值对
+std::string buildConfigText(const Config& cfg) {
     std::string text;
-    text += "# EHsc 配置文件（UTF-8）\n";
+    // ——— 彩蛋（第一行）———
+    text += "# 被你找到了喵 (=^･ω･^=)\n";
+    text += "# EHsc 配置文件（UTF-8）· 这个文件被设成了隐藏属性，删掉也不影响使用，程序会重新生成。\n";
+    text += "# 可以直接编辑下面的键值对；也可以在主菜单「8) 设置」里修改，程序会自动保存到这里。\n";
     text += "[general]\n";
     text += "algos=" + algoIdList(cfg.algos) + "\n";
     text += "threads=" + std::to_string(cfg.threads) + "\n";
@@ -409,8 +685,102 @@ bool saveConfig(const Config& cfg) {
     text += std::string("colors=") + (cfg.colors ? "1" : "0") + "\n";
     text += "filters=" + wideToUtf8(cfg.filters) + "\n";
     text += "lastdir=" + wideToUtf8(cfg.lastDirectory) + "\n";
-    std::wstring err;
-    return writeFileUtf8(configFilePath(), text, false, err);
+    return text;
+}
+
+}  // namespace
+
+std::wstring configFilePath() {
+    if (!g_activeConfigPath.empty()) return g_activeConfigPath;
+    return configCandidates().front();
+}
+
+bool configFileExists() { return pathExists(configFilePath()); }
+
+bool configFileIsHidden() { return isFileHidden(configFilePath()); }
+
+std::wstring configSearchDescription() {
+    std::string out;
+    for (size_t i = 0; i < configCandidates().size(); ++i) {
+        if (i) out += "  →  ";
+        out += wideToUtf8(configCandidates()[i]);
+    }
+    return utf8ToWide(out);
+}
+
+bool loadConfig(Config& cfg) {
+    for (const std::wstring& path : configCandidates()) {
+        std::string text;
+        std::wstring err;
+        if (!readFileUtf8(path, text, err)) continue;
+        g_activeConfigPath = path;
+        std::istringstream stream(text);
+        std::string line;
+        while (std::getline(stream, line)) {
+            line = trimText(line);
+            if (line.empty() || line[0] == '#' || line[0] == ';' || line[0] == '[') continue;
+            const size_t eq = line.find('=');
+            if (eq == std::string::npos) continue;
+            const std::string key = trimText(line.substr(0, eq));
+            const std::string value = trimText(line.substr(eq + 1));
+            if (key == "algos") {
+                std::string bad;
+                const std::vector<Algo> parsed = parseAlgoList(value, &bad);
+                if (!parsed.empty()) cfg.algos = parsed;
+            } else if (key == "threads") {
+                cfg.threads = std::atoi(value.c_str());
+            } else if (key == "bufferMB") {
+                const int mb = std::atoi(value.c_str());
+                if (mb >= 1 && mb <= 64) cfg.bufferMB = static_cast<size_t>(mb);
+            } else if (key == "format") {
+                OutFormat format{};
+                if (parseFormat(value, format)) cfg.format = format;
+            } else if (key == "progress") {
+                cfg.progress = (value != "0");
+            } else if (key == "ascii") {
+                cfg.asciiBar = (value != "0");
+            } else if (key == "overlap") {
+                cfg.overlap = (value != "0");
+            } else if (key == "recursive") {
+                cfg.recursive = (value != "0");
+            } else if (key == "hidden") {
+                cfg.includeHidden = (value != "0");
+            } else if (key == "checksize") {
+                cfg.verifyCheckSize = (value != "0");
+            } else if (key == "bom") {
+                cfg.bom = (value != "0");
+            } else if (key == "colors") {
+                cfg.colors = (value != "0");
+            } else if (key == "filters") {
+                cfg.filters = utf8ToWide(value);
+            } else if (key == "lastdir") {
+                cfg.lastDirectory = utf8ToWide(value);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
+bool saveConfig(const Config& cfg) {
+    const std::string text = buildConfigText(cfg);
+    for (const std::wstring& path : configCandidates()) {
+        const std::wstring dir = parentDir(path);
+        if (dir.empty()) continue;
+        if (!pathExists(dir) && !createDirectories(dir)) continue;
+        if (!isDirectoryWritable(dir)) continue;
+        std::wstring err;
+        if (!writeFileUtf8(path, text, false, err)) continue;
+        setFileHidden(path);          // 隐藏配置文件（不影响读写，只是不在资源管理器里显示）
+        g_activeConfigPath = path;
+        return true;
+    }
+    return false;
+}
+
+bool ensureConfigExists(const Config& cfg) {
+    if (pathExists(configFilePath())) return true;
+    return saveConfig(cfg);
 }
 
 // ============================================================ 进度监视器 ====
@@ -476,9 +846,20 @@ void ProgressMonitor::clearPanel() {
 }
 
 void ProgressMonitor::loop() {
+    constexpr int kClickTogglePause = -2001;
+    constexpr int kClickCancel = -2002;
     auto lastDraw = std::chrono::steady_clock::now();
     while (running_.load()) {
-        const int key = pollKey();
+        const ConsoleEvent event = pollConsoleEvent();
+        int key = -1;
+        if (event.kind == ConsoleEventKind::Key) {
+            key = event.key;
+        } else if (event.kind == ConsoleEventKind::MouseClick) {
+            // 点击面板上的 [空格] / [Q] 区域等同于按对应按键
+            const int hit = lookupClick(event.row, event.column);
+            if (hit == kClickTogglePause) key = ' ';
+            else if (hit == kClickCancel) key = 'q';
+        }
         if (key == ' ') {
             control_.togglePause();
         } else if (key == 'q' || key == 'Q' || key == 27) {
@@ -582,23 +963,67 @@ void ProgressMonitor::drawPanel(ProgressSnapshot& snapshot) {
               << paint("  ·  剩余 ", Color::Gray)
               << (snapshot.eta >= 0 ? formatDuration(snapshot.eta) : std::string("--:--"));
 
-    // 第 5 行：操作提示
-    std::string hintLine = snapshot.cancelled
-                               ? paint(" 正在取消…", Color::Yellow)
-                               : " " + paint(snapshot.paused
-                                                 ? "已暂停：按 [空格] 继续，按 [Q]/[Esc] 取消"
-                                                 : (hint.empty()
-                                                        ? std::string("[空格] 暂停 / 继续    [Q 或 Esc] 取消")
-                                                        : hint),
-                                             Color::Gray);
+    // 第 5 行：操作提示（[空格] 与 [Q] 同时也是可点击区域）
+    constexpr int kClickTogglePause = -2001;
+    constexpr int kClickCancel = -2002;
+    struct HintSegment {
+        std::string text;
+        Color       color;
+        int         clickValue;
+    };
+    std::vector<HintSegment> hintSegments;
+    if (snapshot.cancelled) {
+        hintSegments.push_back({" 正在取消…", Color::Yellow, 0});
+    } else if (snapshot.paused) {
+        hintSegments.push_back({" 已暂停：按 ", Color::Gray, 0});
+        hintSegments.push_back({"[空格]", Color::Cyan, kClickTogglePause});
+        hintSegments.push_back({" 继续，按 ", Color::Gray, 0});
+        hintSegments.push_back({"[Q]", Color::Cyan, kClickCancel});
+        hintSegments.push_back({"/[Esc] 取消", Color::Gray, 0});
+    } else if (!hint.empty()) {
+        hintSegments.push_back({" " + hint, Color::Gray, 0});
+    } else {
+        hintSegments.push_back({" ", Color::Gray, 0});
+        hintSegments.push_back({"[空格]", Color::Cyan, kClickTogglePause});
+        hintSegments.push_back({" 暂停 / 继续    ", Color::Gray, 0});
+        hintSegments.push_back({"[Q 或 Esc]", Color::Cyan, kClickCancel});
+        hintSegments.push_back({" 取消", Color::Gray, 0});
+    }
+    // 可点击区域要按"可见列"登记，因此用不带 ANSI 的文本累计宽度
+    std::string hintLine;
+    std::vector<std::pair<int, int>> pauseSpans;
+    std::vector<std::pair<int, int>> cancelSpans;
+    int visibleColumn = 0;
+    for (const HintSegment& segment : hintSegments) {
+        const int begin = visibleColumn;
+        const int width = static_cast<int>(textDisplayWidth(segment.text));
+        visibleColumn += width;
+        if (segment.clickValue == kClickTogglePause) {
+            pauseSpans.emplace_back(begin, begin + width - 1);
+        } else if (segment.clickValue == kClickCancel) {
+            cancelSpans.emplace_back(begin, begin + width - 1);
+        }
+        hintLine += paint(segment.text, segment.color);
+    }
 
     const std::string lines[5] = {head.str(), fileLine.str(), progressLine.str(), speedLine.str(),
                                   hintLine};
 
     clearPanel();
-    for (const std::string& line : lines) {
+    clickableClear();   // 面板自行管理可点击区域（仅面板可见期间有效）
+    for (size_t i = 0; i < 5; ++i) {
+        const int row = clickableRow();
+        if (i == 4 && interactive_) {
+            for (const auto& span : pauseSpans) {
+                clickableAddSpan(row, span.first, span.second, kClickTogglePause, "[空格]");
+            }
+            for (const auto& span : cancelSpans) {
+                clickableAddSpan(row, span.first, span.second, kClickCancel,
+                                 snapshot.paused ? "[Q]" : "[Q 或 Esc]");
+            }
+        }
         // 按显示宽度截断，避免折行破坏面板行列计算
-        std::cout << truncateToWidth(line, usable) << "\n";
+        std::cout << truncateToWidth(lines[i], usable) << "\n";
     }
     linesDrawn_ = 5;
     std::cout << std::flush;
@@ -626,25 +1051,41 @@ std::string describeSettings(const Config& cfg) {
 void settingsMenu(Config& cfg) {
     for (;;) {
         printSectionTitle("设置");
-        std::cout << "  1) 哈希算法           当前: " << algoDisplayList(cfg.algos) << "\n";
-        std::cout << "  2) 线程数             当前: "
-                  << (cfg.threads > 0 ? std::to_string(cfg.threads)
-                                      : std::to_string(effectiveThreadCount(0)) + " (自动)")
+        clickableClear();
+        std::cout << "  " << paint("配置文件: ", Color::Gray) << wideToUtf8(configFilePath())
+                  << (configFileExists() ? paint(configFileIsHidden() ? "  [已隐藏]" : "  [未隐藏]",
+                                                 Color::Gray)
+                                         : paint("  [尚未创建]", Color::Yellow))
                   << "\n";
-        std::cout << "  3) 读取缓冲区 (MB)    当前: " << cfg.bufferMB << "\n";
-        std::cout << "  4) 默认输出格式       当前: " << formatDisplay(cfg.format) << "\n";
-        std::cout << "  5) 进度条             " << (cfg.progress ? "开" : "关") << "\n";
-        std::cout << "  6) ASCII 进度条       " << (cfg.asciiBar ? "开" : "关") << "\n";
-        std::cout << "  7) 读取/计算流水线    " << (cfg.overlap ? "开" : "关") << "\n";
-        std::cout << "  8) 递归子目录         " << (cfg.recursive ? "开" : "关") << "\n";
-        std::cout << "  9) 文件过滤          当前: "
-                  << (cfg.filters.empty() ? std::string("(无)") : wideToUtf8(cfg.filters)) << "\n";
-        std::cout << " 10) 校验时检查文件大小 " << (cfg.verifyCheckSize ? "开" : "关") << "\n";
-        std::cout << " 11) 输出文件加 UTF-8 BOM " << (cfg.bom ? "开" : "关") << "\n";
-        std::cout << " 12) 彩色输出           " << (cfg.colors ? "开" : "关") << "\n";
-        std::cout << "  0) 返回（自动保存设置）\n";
+        // 设置项也做成可点击的
+        {
+            const std::vector<std::pair<int, std::string>> items = {
+                {1, std::string("  1) 哈希算法           当前: ") + algoDisplayList(cfg.algos)},
+                {2, std::string("  2) 线程数             当前: ") +
+                        (cfg.threads > 0 ? std::to_string(cfg.threads)
+                                         : std::to_string(effectiveThreadCount(0)) + " (自动)")},
+                {3, std::string("  3) 读取缓冲区 (MB)    当前: ") + std::to_string(cfg.bufferMB)},
+                {4, std::string("  4) 默认输出格式       当前: ") + formatDisplay(cfg.format)},
+                {5, std::string("  5) 进度条             ") + (cfg.progress ? "开" : "关")},
+                {6, std::string("  6) ASCII 进度条       ") + (cfg.asciiBar ? "开" : "关")},
+                {7, std::string("  7) 读取/计算流水线    ") + (cfg.overlap ? "开" : "关")},
+                {8, std::string("  8) 递归子目录         ") + (cfg.recursive ? "开" : "关")},
+                {9, std::string("  9) 文件过滤          当前: ") +
+                        (cfg.filters.empty() ? std::string("(无)") : wideToUtf8(cfg.filters))},
+                {10, std::string(" 10) 校验时检查文件大小 ") + (cfg.verifyCheckSize ? "开" : "关")},
+                {11, std::string(" 11) 输出文件加 UTF-8 BOM ") + (cfg.bom ? "开" : "关")},
+                {12, std::string(" 12) 彩色输出           ") + (cfg.colors ? "开" : "关")},
+                {0, "  0) 返回（自动保存设置）"},
+            };
+            for (const auto& item : items) {
+                const int row = clickableRow();
+                std::cout << item.second << "\n";
+                clickableAddRow(row, item.first, item.second);
+            }
+        }
+        printClickHint();
 
-        const int choice = askInt("请选择 [0-12]: ", 0, 12, 0);
+        const int choice = askMenuChoice("请选择 [0-12]: ", 0, 12, 0);
         if (choice == 0) break;
         switch (choice) {
             case 1: {
@@ -670,7 +1111,8 @@ void settingsMenu(Config& cfg) {
                                                           static_cast<int>(cfg.bufferMB)));
                 break;
             case 4: {
-                const int format = askInt("输出格式 1) 文本  2) CSV  3) JSON : ", 1, 3, 1);
+                const int format = askOptionRow("输出格式", {{1, "文本"}, {2, "CSV"}, {3, "JSON"}},
+                                                    static_cast<int>(cfg.format));
                 cfg.format = format == 2 ? OutFormat::Csv : (format == 3 ? OutFormat::Json : OutFormat::Text);
                 break;
             }
@@ -701,24 +1143,40 @@ void settingsMenu(Config& cfg) {
 
 int runInteractiveMenu(Config& cfg) {
     enableColors(cfg.colors);
+    // 首次运行时在程序所在目录生成隐藏的配置文件（放在只读位置时自动改用 %APPDATA%）
+    if (!ensureConfigExists(cfg)) {
+        printWarning("配置文件无法写入，本次设置只在内存中生效（不影响任何哈希功能）");
+    }
     for (;;) {
         clearScreen();
         showBanner();
         std::cout << "\n  " << paint("当前设置: ", Color::Gray) << describeSettings(cfg) << "\n";
 
         printSectionTitle("主菜单");
-        std::cout << "  1) 计算文件哈希          （可多选文件，Windows 原生选择器）\n";
-        std::cout << "  2) 计算文件夹哈希        （递归 / 按通配符过滤）\n";
-        std::cout << "  3) 生成校验清单文件      （TXT / CSV / JSON）\n";
-        std::cout << "  4) 校验清单文件          （检测篡改 / 缺失 / 大小变化）\n";
-        std::cout << "  5) 字节级文件比较        （定位第一个不同字节）\n";
-        std::cout << "  6) 算法速度对比          （同一数据下各算法吞吐量）\n";
-        std::cout << "  7) 运行内置自检          （标准测试向量验证实现）\n";
-        std::cout << "  8) 设置                  （算法 / 线程 / 缓冲区 / 输出格式）\n";
-        std::cout << "  9) 查看支持的算法说明\n";
-        std::cout << "  0) 退出\n";
+        clickableClear();
+        // 每个条目登记为一个可点击区域（鼠标支持时可直接点击选择）
+        struct MenuItem { int value; const char* text; };
+        static const MenuItem kMainMenu[] = {
+            {1, "  1) 计算文件哈希          （可多选文件，Windows 原生选择器）"},
+            {2, "  2) 计算文件夹哈希        （递归 / 按通配符过滤）"},
+            {3, "  3) 生成校验清单文件      （TXT / CSV / JSON）"},
+            {4, "  4) 校验清单文件          （检测篡改 / 缺失 / 大小变化）"},
+            {5, "  5) 字节级文件比较        （定位第一个不同字节）"},
+            {6, "  6) 算法速度对比          （同一数据下各算法吞吐量）"},
+            {7, "  7) 运行内置自检          （标准测试向量验证实现）"},
+            {8, "  8) 文件访问监听          （监听期间谁读取/写入了所选文件）"},
+            {9, "  9) 设置                  （算法 / 线程 / 缓冲区 / 输出格式）"},
+            {10, " 10) 查看支持的算法说明"},
+            {0, "  0) 退出"},
+        };
+        for (const MenuItem& item : kMainMenu) {
+            const int row = clickableRow();
+            std::cout << item.text << "\n";
+            clickableAddRow(row, item.value, item.text);
+        }
+        printClickHint();
 
-        const int choice = askInt("\n请选择 [0-9]: ", 0, 9, -1);
+        const int choice = askMenuChoice("\n请选择 [0-10]: ", 0, 10, -1);
         if (choice <= 0) {
             saveConfig(cfg);
             std::cout << "\n" << paint("感谢使用 EHsc，再见！", Color::Cyan) << "\n\n";
@@ -834,10 +1292,48 @@ int runInteractiveMenu(Config& cfg) {
                 cmdSelfTest(true);
                 break;
             }
-            case 8:
+            case 8: {
+                printSectionTitle("文件访问监听");
+                std::cout << "监听期间，记录所选文件/文件夹被哪个进程读取或写入。\n";
+                std::cout << "提示：想知道是哪个进程，建议以管理员身份运行本程序；\n";
+                std::cout << "      非管理员只能归因当前用户可访问的进程（仍可看到文件变更时间线）。\n";
+                std::cout << "提示：直接回车将打开 Windows 文件/文件夹选择器\n";
+                const std::vector<std::wstring> targets =
+                    askTargets("请输入要监听的文件或文件夹: ", true, false);
+                if (targets.empty()) {
+                    printWarning("未选择任何目标");
+                    break;
+                }
+                const int seconds = askInt("监听时长（秒，0 = 直到按 Q 停止）[默认 30]: ", 0, 86400, 30);
+                WatchRunOptions watch;
+                watch.seconds = static_cast<double>(seconds);
+                watch.recursive = cfg.recursive;
+                watch.filters = parseFilters(cfg.filters);
+                watch.interactivePrompt = true;   // 菜单流程：照常询问是否提权
+                if (askYesNo("是否把监听报告保存成文件? (y/N): ", false)) {
+                    const int format = askOptionRow("报告格式", {{1, "文本"}, {2, "CSV"}, {3, "JSON"}}, 1);
+                    watch.format = format == 2 ? OutFormat::Csv
+                                               : (format == 3 ? OutFormat::Json : OutFormat::Text);
+                    std::string line;
+                    if (readLineUtf8("报告保存路径（回车打开保存对话框）: ", line) && !line.empty()) {
+                        watch.output = stripQuotes(utf8ToWide(line));
+                    } else {
+                        const std::wstring defaultName =
+                            std::wstring(L"ehsc-watch.") + utf8ToWide(formatName(watch.format));
+                        watch.output = pickSaveFile(L"保存监听报告", defaultName, L"报告文件",
+                                                    watch.format == OutFormat::Csv
+                                                        ? L"*.csv"
+                                                        : (watch.format == OutFormat::Json ? L"*.json"
+                                                                                           : L"*.txt"));
+                    }
+                }
+                cmdWatch(cfg, targets, watch);
+                break;
+            }
+            case 9:
                 settingsMenu(cfg);
                 break;
-            case 9:
+            case 10:
                 cmdListAlgos();
                 break;
             default: break;
