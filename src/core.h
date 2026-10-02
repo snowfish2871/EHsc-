@@ -227,4 +227,8 @@ std::string trimText(const std::string& text);
 bool        equalsIgnoreCaseAscii(std::string_view a, std::string_view b);
 std::wstring stripQuotes(const std::wstring& text);
 
+// UTF-8 文本的显示宽度（中日韩全角字符按 2 列计）与按显示宽度右补空格
+size_t      textDisplayWidth(const std::string& utf8Text);
+std::string padToWidth(const std::string& utf8Text, size_t width);
+
 }  // namespace ehsc

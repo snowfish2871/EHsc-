@@ -24,6 +24,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import zlib
 
 ALGOS = [
@@ -323,8 +324,204 @@ def main():
             finally:
                 ctypes.windll.kernel32.CloseHandle(handle)
 
-        # ------------------------------------------------------ 7. 退出码 --
-        print("\n[7] 自检退出码")
+        # ------------------------------------------------------ 7. 独立运行 --
+        print("\n[7] 独立运行 / 隐藏配置文件（回归测试）")
+        import ctypes
+        appdata = os.environ.get("APPDATA", "")
+        appdata_cfg = os.path.join(appdata, "EHsc", "ehsc.ini") if appdata else ""
+        # 只拷贝 exe 到全新目录，模拟“拿到一个可执行文件就能用”
+        solo = os.path.join(workdir, "solo")
+        os.makedirs(solo, exist_ok=True)
+        solo_exe = os.path.join(solo, "EHsc.exe")
+        shutil.copy(exe, solo_exe)
+
+        code, out, err = run(solo_exe, ["selftest"])
+        check(code == 0, "独立目录中的 selftest 失败")
+        check("321" in out, "独立目录中自检项数异常")
+        code, out, err = run(solo_exe, ["hash", os.path.join(workdir, "f_00000064.bin"),
+                                        "-a", "sha256", "--quiet", "--no-progress"])
+        check(code == 0, "独立目录中的 hash 失败")
+        print("  单文件拷贝后 selftest / hash 均正常")
+
+        # 7.1 首次进入交互式菜单：在 exe 同目录生成隐藏配置，第一行是彩蛋
+        if appdata_cfg and os.path.exists(appdata_cfg):
+            os.remove(appdata_cfg)
+        solo_cfg = os.path.join(solo, "ehsc.ini")
+        subprocess.run([solo_exe], input=b"0\r\n", capture_output=True)
+        check(os.path.isfile(solo_cfg), "首次运行应在 exe 同目录生成 ehsc.ini")
+        FILE_ATTRIBUTE_HIDDEN = 0x02
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(ctypes.c_wchar_p(solo_cfg))
+        check(attrs != -1 and (attrs & FILE_ATTRIBUTE_HIDDEN) != 0,
+              "配置文件必须带隐藏属性，实际 attributes=0x%X" % (attrs & 0xFFFFFFFF))
+        with open(solo_cfg, "r", encoding="utf-8") as fh:
+            first_line = fh.readline().strip()
+        check("被你找到了喵" in first_line, "配置文件第一行应为彩蛋，实际: " + first_line)
+        print("  隐藏配置已生成，第一行彩蛋: " + first_line)
+
+        # 7.2 再次保存设置：必须仍然写入同一个隐藏文件
+        #     （回归：CreateFileW 的 CREATE_ALWAYS 无法覆盖带隐藏属性的文件，
+        #       早期版本会因此静默改写 %APPDATA% 下的副本，导致设置看似丢失）
+        before = open(solo_cfg, "r", encoding="utf-8").read()
+        subprocess.run([solo_exe], input=b"9\r\n5\r\n0\r\n0\r\n", capture_output=True)
+        after = open(solo_cfg, "r", encoding="utf-8").read()
+        check(before != after, "第二次保存设置后，exe 同目录的配置文件内容应发生变化")
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(ctypes.c_wchar_p(solo_cfg))
+        check(attrs != -1 and (attrs & FILE_ATTRIBUTE_HIDDEN) != 0,
+              "重复写入后隐藏属性必须保留")
+        if appdata_cfg:
+            check(not os.path.exists(appdata_cfg),
+                  "exe 同目录可写时不应在 %%APPDATA%% 下另建配置：" + appdata_cfg)
+        print("  重复保存仍写回 exe 同目录的隐藏配置文件，未污染 %%APPDATA%%")
+
+        # 7.3 输出被重定向时，重绑逻辑绝不能把用户的重定向弄丢
+        #     （回归：提权修复引入的 rebindConsoleStreams）
+        code, out, err = run(exe, ["config"])
+        check("配置文件" in out, "重定向时 config 输出应完整（stdout 未被劫持）：\n" + out + err)
+        if "[EHsc] 检测到标准流" in (out + err):
+            check("输出=终端窗口" not in (out + err),
+                  "stdout 明明被重定向，却被重绑到了控制台：\n" + out + err)
+            print("  重绑只发生在不可用的输入句柄上，输出重定向保持不变")
+        else:
+            print("  正常重定向未被误判为控制台句柄损坏")
+
+        # -------------------------------------------------- 8. 文件访问监听 --
+        print("\n[8] 文件访问监听（watch：监听期间谁读取/写入了文件）")
+        watch_dir = os.path.join(workdir, "watched")
+        os.makedirs(watch_dir, exist_ok=True)
+        watch_file = os.path.join(watch_dir, "watched.dat")
+        with open(watch_file, "wb") as fh:
+            fh.write(b"original")
+        watch_report = os.path.join(workdir, "watch_report.json")
+
+        watcher = subprocess.Popen(
+            [exe, "watch", watch_dir, "--watch", "8", "-o", watch_report, "-f", "json",
+             "--no-progress", "--no-elevate"],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        time.sleep(2.5)
+        # 让一个子进程持有该文件 3 秒并写入：句柄采样应当能抓到它
+        helper_code = (
+            "import time\n"
+            "f = open(r'%s', 'r+b')\n"
+            "f.seek(0)\n"
+            "f.write(b'TAMPERED')\n"
+            "f.flush()\n"
+            "time.sleep(3)\n"
+            "f.close()\n" % watch_file)
+        helper = subprocess.Popen([sys.executable, "-c", helper_code],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        helper.wait(timeout=30)
+        watcher.wait(timeout=90)
+        check(os.path.isfile(watch_report), "watch 未生成报告文件")
+        if os.path.isfile(watch_report):
+            with open(watch_report, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            check(data.get("kind") == "watch", "报告 kind 应为 watch")
+            changes = data.get("changes", [])
+            accesses = data.get("accesses", [])
+            check(len(changes) >= 1, "写入目标文件后应至少记录 1 条变更事件")
+            if changes:
+                check(any(os.path.basename(c.get("path", "")) == "watched.dat" for c in changes),
+                      "变更事件里应包含被写入的目标文件")
+            if accesses:
+                writers = [a for a in accesses
+                           if a.get("operation") in ("write", "readwrite")
+                           and "python" in a.get("process", "").lower()]
+                check(bool(writers),
+                      "句柄通道有结果时必须指认出写入进程，实际: %s" %
+                      [(a.get("process"), a.get("operation")) for a in accesses])
+                print("  已归因进程: " + ", ".join(
+                    "%s(pid %s, %s)" % (a.get("process"), a.get("pid"), a.get("operation"))
+                    for a in accesses))
+            else:
+                print("  (本次未捕获到持续句柄，仅验证了变更通道)")
+            check(bool(data.get("note")), "报告应包含权限/能力说明")
+            print("  变更事件 %d 条，访问记录 %d 条" % (len(changes), len(accesses)))
+
+        # 纯变更通道（--no-handles）也必须工作
+        report2 = os.path.join(workdir, "watch_report2.txt")
+        proc = subprocess.Popen([exe, "watch", watch_dir, "--watch", "5", "--no-handles",
+                                 "-o", report2, "-f", "txt", "--no-progress", "--no-elevate"],
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        time.sleep(2)
+        with open(watch_file, "ab") as fh:
+            fh.write(b"more")
+        proc.wait(timeout=60)
+        check(os.path.isfile(report2), "--no-handles 模式未生成报告")
+        if os.path.isfile(report2):
+            with open(report2, "r", encoding="utf-8") as fh:
+                text = fh.read()
+            check("文件访问监听报告" in text, "报告缺少标题")
+            check("内容写入" in text or "新建" in text, "--no-handles 模式应记录变更事件")
+            print("  --no-handles（纯变更通道）正常")
+
+        # 8.3 提权询问：答 N → 不提权、照常监听
+        report3 = os.path.join(workdir, "watch_no_elev.json")
+        proc = subprocess.run([exe, "watch", watch_dir, "--watch", "4", "-o", report3,
+                               "-f", "json", "--no-progress"],
+                              input=b"n\r\n", capture_output=True, timeout=120)
+        text3 = proc.stdout.decode("utf-8", errors="replace")
+        check("是否以管理员身份" in text3, "未提权启动监听时应主动询问是否提权：\n" + text3)
+        check("不提权" in text3, "回答 N 后应说明以当前权限继续")
+        check(os.path.isfile(report3), "回答 N 后监听应当照常执行并生成报告")
+        print("  提权询问（答 N）→ 以当前权限完成监听")
+
+        # 8.4 提权询问：答 Y → 走提权流程重启自己
+        #     （自动化里用 EHSC_ELEVATE_VERB=open 代替 runas，避免弹出真实 UAC 对话框；
+        #       重启链路本身与 runas 完全一致，只有动词不同）
+        report4 = os.path.join(workdir, "watch_elevated.json")
+        env_open = dict(os.environ, EHSC_ELEVATE_VERB="open")
+        text4 = ""
+        try:
+            proc = subprocess.run([exe, "watch", watch_dir, "--watch", "4", "-o", report4,
+                                   "-f", "json", "--no-progress"],
+                                  input=b"y\r\n", capture_output=True, timeout=150,
+                                  env=env_open)
+            text4 = proc.stdout.decode("utf-8", errors="replace")
+        except subprocess.TimeoutExpired as exc:
+            text4 = (exc.stdout or b"").decode("utf-8", errors="replace")
+        check("已在新窗口" in text4, "回答 Y 后应启动提权后的新实例：\n" + text4)
+        check(os.path.isfile(report4), "提权重启后应由子进程写出报告")
+        print("  提权询问（答 Y）→ 重启为管理员实例并由子进程完成监听")
+
+        # 8.5 提权被拒绝 / 不可用 → 不执行监听并返回上一层
+        report5 = os.path.join(workdir, "watch_cancelled.json")
+        # 用确定性开关模拟"UAC 被拒绝"，不依赖 shell 对未知动词的行为（那会弹系统对话框）
+        env_bad = dict(os.environ, EHSC_ELEVATE_SIMULATE="cancel")
+        proc = subprocess.run([exe, "watch", watch_dir, "--watch", "4", "-o", report5,
+                               "-f", "json", "--no-progress"],
+                              input=b"y\r\n", capture_output=True, timeout=120, env=env_bad)
+        text5 = proc.stdout.decode("utf-8", errors="replace")
+        check(proc.returncode != 0, "提权未能完成时不应以成功退出（实际 %d）" % proc.returncode)
+        check(not os.path.exists(report5), "提权未能完成时不应执行监听、不应生成报告")
+        check("本次监听未执行" in text5 or "无法以管理员身份启动" in text5,
+              "提权失败时必须明确告知未执行：\n" + text5)
+        print("  提权被拒绝/不可用 → 本次监听未执行并返回上一层（退出码 %d）" % proc.returncode)
+
+        # 8.6 无人应答保护：真实控制台（CREATE_NEW_CONSOLE）里没人回答提问时，
+        #     必须在超时后自动按"不提权"继续，绝不能永久卡住调用方
+        report6 = os.path.join(workdir, "watch_timeout.json")
+        env_timeout = dict(os.environ, EHSC_ELEVATE_TIMEOUT="2")
+        start = time.time()
+        proc = subprocess.Popen(
+            [exe, "watch", watch_dir, "--watch", "3", "-o", report6, "-f", "json",
+             "--no-progress"],
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0), env=env_timeout)
+        proc.wait(timeout=90)
+        elapsed = time.time() - start
+        check(os.path.isfile(report6), "提问超时后应自动以当前权限执行监听")
+        check(elapsed < 40, "无人应答时不应长时间阻塞（实际 %.1f 秒）" % elapsed)
+        print("  无人应答超时保护正常（%.1f 秒内自动继续）" % elapsed)
+
+        # 8.7 输入是没有数据的管道时直接跳过提问（脚本安全）
+        proc = subprocess.run([exe, "watch", watch_dir, "--watch", "3", "--no-progress",
+                               "-o", os.path.join(workdir, "watch_pipe.json"), "-f", "json"],
+                              input=b"", capture_output=True, timeout=90)
+        text7 = proc.stdout.decode("utf-8", errors="replace")
+        check("无法询问是否提权" in text7, "无数据的管道不应触发提问：\n" + text7)
+        print("  无可读输入时不提问（脚本不会被卡住）")
+
+        # ------------------------------------------------------ 9. 退出码 --
+        print("\n[9] 自检退出码")
         code, out, err = run(exe, ["selftest"])
         check(code == 0, "selftest 应返回 0，实际 %d" % code)
         check("321" in out, "自检项数异常")

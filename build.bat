@@ -55,14 +55,34 @@ if defined GENERATOR (
 )
 if errorlevel 1 exit /b 1
 
-echo [4/4] Building...
+echo [4/5] Building...
 "!CMAKE!" --build build --config Release
+if errorlevel 1 exit /b 1
+
+rem ---- build a standalone distribution folder -------------------------------
+rem  EHsc.exe is linked against the static CRT (/MT), so this single file is
+rem  everything a user needs: no source tree, no VC++ redistributable, no DLL.
+echo [5/5] Packing standalone dist...
+if exist dist rmdir /s /q dist
+mkdir dist
+copy /y "build\bin\EHsc.exe" "dist\EHsc.exe" >nul
 if errorlevel 1 exit /b 1
 
 echo.
 echo ============================================================
-echo  Build finished:  build\bin\EHsc.exe
-echo  Run self test :  build\bin\EHsc.exe selftest
-echo  Interactive   :  build\bin\EHsc.exe
+echo  Build finished :  build\bin\EHsc.exe
+echo  Standalone     :  dist\EHsc.exe   (single file, copy anywhere)
+echo.
+echo  Verifying standalone operation (self test, no source needed)...
+"dist\EHsc.exe" selftest
+if errorlevel 1 (
+  echo  [WARN] self test failed
+  exit /b 1
+)
+echo  Standalone self test passed.
+echo.
+echo  Run self test :  dist\EHsc.exe selftest
+echo  Interactive   :  dist\EHsc.exe
+echo  Config info   :  dist\EHsc.exe config
 echo ============================================================
 exit /b 0

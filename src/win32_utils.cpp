@@ -14,6 +14,7 @@
 #include <windows.h>
 
 #include <shobjidl.h>   // IFileOpenDialog / IFileSaveDialog
+#include <shellapi.h>   // ShellExecuteExW（UAC 提权重启）
 #include <conio.h>      // _kbhit / _getch
 #include <fcntl.h>      // _O_BINARY
 #include <io.h>         // _isatty / _setmode
@@ -21,7 +22,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdio>
 #include <cwctype>
+#include <iostream>
 #include <mutex>
 
 namespace ehsc {
@@ -31,6 +34,8 @@ UINT g_originalOutputCP = 0;
 UINT g_originalInputCP = 0;
 DWORD g_originalOutputMode = 0;
 bool g_consoleSaved = false;
+bool g_consoleInputModeSaved = false;
+DWORD g_originalInputMode = 0;
 
 bool isConsoleHandle(HANDLE h) {
     DWORD mode = 0;
@@ -118,6 +123,78 @@ std::wstring shellItemPath(IShellItem* item) {
 }  // namespace
 
 // ======================================================== 控制台 UTF-8 ====
+namespace {
+
+// 标准句柄是否"可用"：文件/管道重定向算可用（要保留重定向），
+// 字符设备必须是真正的控制台才算可用。
+bool handleIsUsable(HANDLE h) {
+    if (h == nullptr || h == INVALID_HANDLE_VALUE) return false;
+    SetLastError(0);
+    const DWORD type = GetFileType(h);
+    if (type == FILE_TYPE_UNKNOWN && GetLastError() != NO_ERROR) return false;
+    if (type == FILE_TYPE_CHAR) {
+        DWORD mode = 0;
+        return GetConsoleMode(h, &mode) != 0;
+    }
+    return true;   // 磁盘文件 / 管道：属于正常重定向
+}
+
+HANDLE openConsoleDevice(const wchar_t* name) {
+    HANDLE h = CreateFileW(name, GENERIC_READ | GENERIC_WRITE,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    return h == INVALID_HANDLE_VALUE ? nullptr : h;
+}
+
+}  // namespace
+
+namespace {
+bool g_streamsRebound = false;
+}
+
+bool consoleStreamsWereRebound() { return g_streamsRebound; }
+
+bool rebindConsoleStreams() {
+    // 没有控制台窗口（例如输出被完全重定向到文件/管道）就什么都不做
+    if (GetConsoleWindow() == nullptr) return false;
+
+    bool rebound = false;
+    // 三条流各自判断、各自重绑：某一条合法重定向（比如 stderr 写日志文件）时不能被牵连
+    if (!handleIsUsable(GetStdHandle(STD_OUTPUT_HANDLE))) {
+        HANDLE con = openConsoleDevice(L"CONOUT$");
+        if (con != nullptr) {
+            SetStdHandle(STD_OUTPUT_HANDLE, con);
+            FILE* stream = nullptr;
+            (void)freopen_s(&stream, "CONOUT$", "w", stdout);
+            std::cout.clear();
+            std::cout << std::unitbuf;   // 重绑后立即生效，便于实时看到日志
+            rebound = true;
+        }
+    }
+    if (!handleIsUsable(GetStdHandle(STD_ERROR_HANDLE))) {
+        HANDLE con = openConsoleDevice(L"CONOUT$");
+        if (con != nullptr) {
+            SetStdHandle(STD_ERROR_HANDLE, con);
+            FILE* stream = nullptr;
+            (void)freopen_s(&stream, "CONOUT$", "w", stderr);
+            std::cerr.clear();
+            std::cerr << std::unitbuf;
+            rebound = true;
+        }
+    }
+    if (!handleIsUsable(GetStdHandle(STD_INPUT_HANDLE))) {
+        HANDLE con = openConsoleDevice(L"CONIN$");
+        if (con != nullptr) {
+            SetStdHandle(STD_INPUT_HANDLE, con);
+            FILE* stream = nullptr;
+            (void)freopen_s(&stream, "CONIN$", "r", stdin);
+            std::cin.clear();
+            rebound = true;
+        }
+    }
+    g_streamsRebound = rebound;
+    return rebound;
+}
+
 void setupConsoleUtf8() {
     if (!g_consoleSaved) {
         g_originalOutputCP = GetConsoleOutputCP();
@@ -137,6 +214,20 @@ void setupConsoleUtf8() {
                 ENABLE_WRAP_AT_EOL_OUTPUT;
         SetConsoleMode(hOut, mode);
     }
+    // 关掉"快速编辑模式"：Windows 控制台默认开启它，用户一旦在窗口里点一下鼠标进入
+    // 选择状态，任何后续输出都会阻塞（表现为程序"卡死"），而且鼠标事件也不会传给程序。
+    // 程序运行期间先禁用（同时显式打开鼠标输入），退出时 restoreConsole() 会还原原始模式。
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD inMode = 0;
+    if (GetConsoleMode(hIn, &inMode)) {
+        if (!g_consoleInputModeSaved) {
+            g_originalInputMode = inMode;
+            g_consoleInputModeSaved = true;
+        }
+        DWORD updated = inMode | ENABLE_EXTENDED_FLAGS | ENABLE_MOUSE_INPUT;
+        updated &= ~static_cast<DWORD>(ENABLE_QUICK_EDIT_MODE);
+        SetConsoleMode(hIn, updated);
+    }
     // 让标准流以二进制方式工作，避免 CRT 再做一次编码转换
     (void)_setmode(_fileno(stdout), _O_BINARY);
     (void)_setmode(_fileno(stderr), _O_BINARY);
@@ -147,6 +238,11 @@ void restoreConsole() {
     if (!g_consoleSaved) return;
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     if (g_originalOutputMode) SetConsoleMode(hOut, g_originalOutputMode);
+    // 还原被我们临时关掉的"快速编辑模式"
+    if (g_consoleInputModeSaved) {
+        SetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), g_originalInputMode);
+        g_consoleInputModeSaved = false;
+    }
     if (g_originalOutputCP) SetConsoleOutputCP(g_originalOutputCP);
     if (g_originalInputCP) SetConsoleCP(g_originalInputCP);
     (void)_setmode(_fileno(stdout), _O_TEXT);
@@ -190,16 +286,146 @@ void clearScreen() {
 }
 
 // ============================================================== 键盘 ====
-int pollKey() {
-    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
-    if (!isConsoleHandle(hIn)) return -1;
-    if (!_kbhit()) return -1;
-    const int ch = _getch();
-    if (ch == 0 || ch == 0xE0) {   // 功能键/方向键：吃掉后续字节
-        if (_kbhit()) (void)_getch();
-        return 0;
+bool stdinIsConsole() { return isConsoleHandle(GetStdHandle(STD_INPUT_HANDLE)); }
+
+bool stdinHasPendingInput() {
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    if (isConsoleHandle(h)) return true;
+    if (h == nullptr || h == INVALID_HANDLE_VALUE) return false;
+    // 管道：看缓冲区里是否已经有数据
+    DWORD available = 0;
+    if (PeekNamedPipe(h, nullptr, 0, nullptr, &available, nullptr)) return available > 0;
+    // 文件重定向：整个文件都是可读的，读一行不会阻塞
+    if (GetFileType(h) == FILE_TYPE_DISK) {
+        LARGE_INTEGER size{};
+        if (GetFileSizeEx(h, &size)) return size.QuadPart > 0;
     }
-    return ch;
+    return false;
+}
+
+namespace {
+HANDLE g_consoleInput = nullptr;
+bool   g_consoleInputTried = false;
+bool   g_leftButtonDown = false;   // 用于识别"左键按下"这一瞬间
+
+// 直接拿一个可用的控制台输入句柄：标准输入可用就用它，否则自己打开 CONIN$。
+// （不依赖 <conio.h> 的句柄缓存，提权后重绑控制台时也能正常工作。）
+HANDLE consoleInputHandle() {
+    if (g_consoleInputTried) return g_consoleInput;
+    g_consoleInputTried = true;
+    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (h != nullptr && h != INVALID_HANDLE_VALUE && GetConsoleMode(h, &mode)) {
+        g_consoleInput = h;
+        return g_consoleInput;
+    }
+    g_consoleInput = openConsoleDevice(L"CONIN$");
+    return g_consoleInput;
+}
+}  // namespace
+
+ConsoleEvent pollConsoleEvent() {
+    ConsoleEvent result;
+    HANDLE hIn = consoleInputHandle();
+    if (hIn == nullptr) return result;
+
+    DWORD pending = 0;
+    if (!GetNumberOfConsoleInputEvents(hIn, &pending) || pending == 0) return result;
+
+    // 逐条读取，跳过鼠标移动/窗口事件与按键抬起事件；用 ReadConsoleInputW 而不是 _getch，
+    // 这样可以自己解析 ESC（虚拟键码）、同时拿到鼠标事件，也不会被 CRT 缓存句柄影响。
+    for (DWORD i = 0; i < pending; ++i) {
+        INPUT_RECORD record{};
+        DWORD read = 0;
+        if (!ReadConsoleInputW(hIn, &record, 1, &read) || read == 0) break;
+
+        if (record.EventType == KEY_EVENT) {
+            if (!record.Event.KeyEvent.bKeyDown) continue;
+            const wchar_t ch = record.Event.KeyEvent.uChar.UnicodeChar;
+            if (ch != 0) {
+                if (ch < 128) {
+                    result.kind = ConsoleEventKind::Key;
+                    result.key = static_cast<int>(ch);
+                    return result;
+                }
+                continue;   // 非 ASCII（中文输入等）忽略
+            }
+            const WORD vk = record.Event.KeyEvent.wVirtualKeyCode;
+            if (vk == VK_ESCAPE) {
+                result.kind = ConsoleEventKind::Key;
+                result.key = 27;
+                return result;
+            }
+            if (vk == VK_RETURN) {
+                result.kind = ConsoleEventKind::Key;
+                result.key = '\r';
+                return result;
+            }
+            continue;   // 其它功能键忽略，继续看后面还有没有可用事件
+        }
+
+        if (record.EventType == MOUSE_EVENT) {
+            const MOUSE_EVENT_RECORD& mouse = record.Event.MouseEvent;
+            const bool leftDown = (mouse.dwButtonState & FROM_LEFT_1ST_BUTTON_PRESSED) != 0;
+            if (leftDown && !g_leftButtonDown) {
+                g_leftButtonDown = true;
+                result.kind = ConsoleEventKind::MouseClick;
+                result.row = mouse.dwMousePosition.Y;
+                result.column = mouse.dwMousePosition.X;
+                return result;
+            }
+            if (!leftDown) g_leftButtonDown = false;
+        }
+    }
+    return result;
+}
+
+int pollKey() {
+    const ConsoleEvent event = pollConsoleEvent();
+    return event.kind == ConsoleEventKind::Key ? event.key : -1;
+}
+
+int consoleCursorRow() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (hOut == nullptr || hOut == INVALID_HANDLE_VALUE) return -1;
+    if (!GetConsoleScreenBufferInfo(hOut, &info)) return -1;
+    return info.dwCursorPosition.Y;
+}
+
+int consoleCursorColumn() {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (hOut == nullptr || hOut == INVALID_HANDLE_VALUE) return -1;
+    if (!GetConsoleScreenBufferInfo(hOut, &info)) return -1;
+    return info.dwCursorPosition.X;
+}
+
+std::string consoleLineText(int row) {
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    CONSOLE_SCREEN_BUFFER_INFO info{};
+    if (hOut == nullptr || hOut == INVALID_HANDLE_VALUE) return std::string();
+    if (!GetConsoleScreenBufferInfo(hOut, &info)) return std::string();
+    if (row < 0 || row >= info.dwSize.Y) return std::string();
+    const int width = info.dwSize.X;
+    if (width <= 0) return std::string();
+    std::vector<wchar_t> buffer(static_cast<size_t>(width) + 1, L'\0');
+    DWORD read = 0;
+    COORD pos{0, static_cast<SHORT>(row)};
+    if (!ReadConsoleOutputCharacterW(hOut, buffer.data(), static_cast<DWORD>(width), pos, &read)) {
+        return std::string();
+    }
+    std::wstring line(buffer.data(), read);
+    while (!line.empty() && (line.back() == L' ' || line.back() == L'\0')) line.pop_back();
+    return wideToUtf8(line);
+}
+
+bool consoleMouseAvailable() {
+    HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+    DWORD mode = 0;
+    if (hIn == nullptr || hIn == INVALID_HANDLE_VALUE) return false;
+    if (!GetConsoleMode(hIn, &mode)) return false;
+    return (mode & ENABLE_MOUSE_INPUT) != 0;
 }
 
 // ====================================================== UTF-8 转换 ====
@@ -258,6 +484,119 @@ std::wstring formatWinError(unsigned long code) {
 }
 
 std::wstring lastWinError() { return formatWinError(GetLastError()); }
+
+// ============================================================ 提权相关 ====
+bool isProcessElevated() {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return false;
+    TOKEN_ELEVATION elevation{};
+    DWORD size = sizeof(elevation);
+    const bool ok = GetTokenInformation(token, TokenElevation, &elevation, size, &size) != 0;
+    CloseHandle(token);
+    return ok && elevation.TokenIsElevated != 0;
+}
+
+std::wstring quoteCommandLineArgument(const std::wstring& argument) {
+    if (!argument.empty() && argument.find_first_of(L" \t\n\v\"") == std::wstring::npos) {
+        return argument;   // 无需引号
+    }
+    std::wstring out = L"\"";
+    for (auto it = argument.begin();; ++it) {
+        size_t backslashes = 0;
+        while (it != argument.end() && *it == L'\\') {
+            ++it;
+            ++backslashes;
+        }
+        if (it == argument.end()) {
+            out.append(backslashes * 2, L'\\');   // 结尾反斜杠要加倍，避免转义收尾引号
+            break;
+        }
+        if (*it == L'"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out += L'"';
+        } else {
+            out.append(backslashes, L'\\');
+            out += *it;
+        }
+    }
+    out += L'"';
+    return out;
+}
+
+namespace {
+HANDLE g_elevatedChild = nullptr;   // 提权子进程句柄（等待后关闭）
+}
+
+ElevateStatus relaunchElevated(const std::wstring& parameters, unsigned long* lastError) {
+    // 自动化测试用：直接模拟"提权被拒绝 / 提权失败"，避免依赖真实 UAC 或 shell 行为
+    // （EHSC_ELEVATE_SIMULATE=cancel | fail）
+    {
+        wchar_t simulate[16] = {0};
+        const DWORD len = GetEnvironmentVariableW(L"EHSC_ELEVATE_SIMULATE", simulate, 16);
+        if (len > 0 && len < 16) {
+            if (_wcsicmp(simulate, L"cancel") == 0) {
+                if (lastError) *lastError = ERROR_CANCELLED;
+                return ElevateStatus::Cancelled;
+            }
+            if (_wcsicmp(simulate, L"fail") == 0) {
+                if (lastError) *lastError = ERROR_ACCESS_DENIED;
+                return ElevateStatus::Failed;
+            }
+        }
+    }
+
+    const std::wstring exe = executablePath();
+    if (exe.empty()) {
+        if (lastError) *lastError = ERROR_FILE_NOT_FOUND;
+        return ElevateStatus::Failed;
+    }
+
+    std::wstring verb = L"runas";   // 正规提权流程（会弹 UAC）
+    // 调试/自动化测试用的动词覆盖：设成 "open" 即以普通权限重启，便于验证重启链路
+    {
+        wchar_t buffer[32] = {0};
+        const DWORD len = GetEnvironmentVariableW(L"EHSC_ELEVATE_VERB", buffer, 32);
+        if (len > 0 && len < 32) verb.assign(buffer, len);
+    }
+
+    SHELLEXECUTEINFOW info{};
+    info.cbSize = sizeof(info);
+    // SEE_MASK_NO_CONSOLE：让提权后的新进程拥有自己的控制台。
+    // 若不加这个标志，子进程会尝试继承父进程（中完整性级别）的控制台，
+    // 结果是标准句柄不可用 —— 表现为"新窗口里什么都不打印、按 Q 也停不下来"。
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC | SEE_MASK_NO_CONSOLE;
+    info.hwnd = reinterpret_cast<HWND>(GetConsoleWindow());
+    info.lpVerb = verb.c_str();
+    info.lpFile = exe.c_str();
+    info.lpParameters = parameters.empty() ? nullptr : parameters.c_str();
+    info.lpDirectory = nullptr;          // 继承当前工作目录
+    info.nShow = SW_SHOWNORMAL;
+
+    if (!ShellExecuteExW(&info)) {
+        const DWORD code = GetLastError();
+        if (lastError) *lastError = code;
+        // ERROR_CANCELLED：用户在 UAC 对话框上选择了"否"
+        return code == ERROR_CANCELLED ? ElevateStatus::Cancelled : ElevateStatus::Failed;
+    }
+    if (g_elevatedChild) CloseHandle(g_elevatedChild);
+    g_elevatedChild = info.hProcess;
+    if (lastError) *lastError = 0;
+    return ElevateStatus::Started;
+}
+
+int waitForElevatedChild(unsigned long timeoutMs) {
+    if (g_elevatedChild == nullptr) return -1;
+    const DWORD wait = WaitForSingleObject(g_elevatedChild,
+                                           timeoutMs == 0 ? INFINITE : timeoutMs);
+    int code = -1;
+    if (wait == WAIT_OBJECT_0) {
+        DWORD exitCode = 0;
+        if (GetExitCodeProcess(g_elevatedChild, &exitCode)) code = static_cast<int>(exitCode);
+    }
+    CloseHandle(g_elevatedChild);
+    g_elevatedChild = nullptr;
+    return code;
+}
 
 // ========================================================== 路径工具 ====
 bool isAbsolutePath(const std::wstring& path) {
@@ -530,10 +869,22 @@ bool WinFile::read(void* buffer, size_t capacity, size_t& got, std::wstring& err
 bool writeFileUtf8(const std::wstring& path, const std::string& data, bool withBom,
                    std::wstring& err) {
     const std::wstring extended = toExtendedPath(path);
+
+    // 重要：CreateFileW 的 CREATE_ALWAYS 无法覆盖带「隐藏」属性的已存在文件
+    // （会直接失败并返回 ERROR_ACCESS_DENIED）。隐藏的配置文件正属于这种情况，
+    // 因此这里先临时摘掉隐藏属性，写完后原样恢复。
+    const DWORD originalAttrs = GetFileAttributesW(extended.c_str());
+    const bool existed = originalAttrs != INVALID_FILE_ATTRIBUTES;
+    const bool wasHidden = existed && (originalAttrs & FILE_ATTRIBUTE_HIDDEN) != 0;
+    if (wasHidden) {
+        SetFileAttributesW(extended.c_str(), originalAttrs & ~FILE_ATTRIBUTE_HIDDEN);
+    }
+
     HANDLE handle = CreateFileW(extended.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
                                 CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (handle == INVALID_HANDLE_VALUE) {
         err = lastWinError() + L"（" + path + L"）";
+        if (wasHidden) SetFileAttributesW(extended.c_str(), originalAttrs);
         return false;
     }
     bool ok = true;
@@ -566,6 +917,11 @@ bool writeFileUtf8(const std::wstring& path, const std::string& data, bool withB
         }
     }
     CloseHandle(handle);
+    if (wasHidden) {
+        // 恢复隐藏属性（成功与否都恢复，避免留下“写着写着就可见了”的文件）
+        SetFileAttributesW(extended.c_str(), GetFileAttributesW(extended.c_str()) |
+                                                 FILE_ATTRIBUTE_HIDDEN);
+    }
     return ok;
 }
 
@@ -591,6 +947,86 @@ bool readFileUtf8(const std::wstring& path, std::string& data, std::wstring& err
         data.erase(0, 3);
     }
     return true;
+}
+
+// ==================================================== 目录与文件属性 ====
+bool createDirectories(const std::wstring& path) {
+    if (path.empty()) return false;
+    if (isDirectory(path)) return true;
+    std::wstring built;
+    size_t i = 0;
+    // 保留盘符（C:）或 UNC 前缀（\\server\share）
+    if (path.size() >= 2 && path[1] == L':') {
+        built = path.substr(0, 2);
+        i = 2;
+    } else if (path.size() >= 2 && path[0] == L'\\' && path[1] == L'\\') {
+        const size_t sep = path.find(L'\\', 2);
+        if (sep == std::wstring::npos) return false;
+        built = path.substr(0, sep);
+        i = sep;
+    }
+    for (; i <= path.size(); ++i) {
+        if (i == path.size() || path[i] == L'\\' || path[i] == L'/') {
+            if (!built.empty() && !isDirectory(built)) {
+                if (!CreateDirectoryW(toExtendedPath(built).c_str(), nullptr)) {
+                    const DWORD code = GetLastError();
+                    if (code != ERROR_ALREADY_EXISTS) return false;
+                }
+            }
+        }
+        if (i < path.size()) built.push_back(path[i]);
+    }
+    return isDirectory(path);
+}
+
+bool setFileHidden(const std::wstring& path) {
+    const std::wstring p = toExtendedPath(path);
+    const DWORD attrs = GetFileAttributesW(p.c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) return false;
+    return SetFileAttributesW(p.c_str(), attrs | FILE_ATTRIBUTE_HIDDEN) != 0;
+}
+
+bool isFileHidden(const std::wstring& path) {
+    const std::wstring p = toExtendedPath(path);
+    const DWORD attrs = GetFileAttributesW(p.c_str());
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_HIDDEN) != 0;
+}
+
+bool isDirectoryWritable(const std::wstring& dir) {
+    if (dir.empty() || !isDirectory(dir)) return false;
+    wchar_t name[MAX_PATH] = {0};
+    if (GetTempFileNameW(toExtendedPath(dir).c_str(), L"ewt", 0, name) == 0) return false;
+    // GetTempFileNameW 会真正创建一个文件：确认能删除即视为可写
+    return DeleteFileW(name) != 0;
+}
+
+std::wstring environmentVariable(const wchar_t* name) {
+    if (name == nullptr) return std::wstring();
+    const DWORD len = GetEnvironmentVariableW(name, nullptr, 0);
+    if (len == 0) return std::wstring();
+    std::vector<wchar_t> buffer(static_cast<size_t>(len) + 1, L'\0');
+    const DWORD written = GetEnvironmentVariableW(name, buffer.data(), len + 1);
+    if (written == 0 || written > len) return std::wstring();
+    return std::wstring(buffer.data(), written);
+}
+
+std::wstring roamingAppDataDirectory() {
+    std::wstring dir = environmentVariable(L"APPDATA");
+    if (!dir.empty()) return dir;
+    const std::wstring profile = environmentVariable(L"USERPROFILE");
+    if (!profile.empty()) return joinPath(joinPath(profile, L"AppData"), L"Roaming");
+    return std::wstring();
+}
+
+std::wstring tempDirectory() {
+    std::wstring dir = environmentVariable(L"TEMP");
+    if (!dir.empty()) return dir;
+    dir = environmentVariable(L"TMP");
+    if (!dir.empty()) return dir;
+    std::vector<wchar_t> buffer(MAX_PATH + 1, L'\0');
+    const DWORD len = GetTempPathW(MAX_PATH, buffer.data());
+    if (len > 0 && len <= MAX_PATH) return std::wstring(buffer.data(), len);
+    return std::wstring();
 }
 
 // ==================================================== 原生文件选择器 ====

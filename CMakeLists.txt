@@ -1,4 +1,4 @@
-﻿# ============================================================================
+# ============================================================================
 #  EHsc · CMakeLists.txt
 #  纯 C++ 命令行哈希工具（版本 2.0.0bate）—— 零第三方依赖，仅使用 Windows 原生 API。
 #
@@ -15,10 +15,10 @@
 cmake_minimum_required(VERSION 3.16)
 
 # 版本号：CMake 的 VERSION 字段只接受纯数字，完整版本串单独定义并传给编译器
-set(EHSC_VERSION_STRING "2.0.0bate")
+set(EHSC_VERSION_STRING "2.1.1")
 
 project(EHsc
-        VERSION 2.0.0
+        VERSION 2.1.1
         DESCRIPTION "纯 C++ 文件哈希 / 校验 / 比较命令行工具（无第三方依赖）"
         LANGUAGES CXX)
 
@@ -28,6 +28,13 @@ set(EHSC_CXX_STANDARD "20" CACHE STRING "C++ 标准版本 (17 或 20)")
 set(CMAKE_CXX_STANDARD ${EHSC_CXX_STANDARD})
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+# ------------------------------------------------- 独立可执行文件（/MT） --
+# 静态链接 C/C++ 运行库：生成的 EHsc.exe 不依赖 MSVCP140.dll / VCRUNTIME140.dll
+# 等 VC++ 运行库，只依赖 Windows 自带系统 DLL，可单独拷到任意机器直接运行。
+# （若想改回 /MD，需要目标机器安装 VC++ 可再发行组件包。）
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING
+    "MSVC 运行库：静态(/MT) 或动态(/MD)" FORCE)
 
 if(NOT WIN32)
     message(FATAL_ERROR "EHsc 依赖 Windows 原生 API（文件对话框 / 控制台 / CreateFileW），仅支持 Windows。")
@@ -40,6 +47,7 @@ add_executable(EHsc
     src/core.cpp
     src/report.cpp
     src/hashes.cpp
+    src/watch.cpp
     src/win32_utils.cpp
 )
 
