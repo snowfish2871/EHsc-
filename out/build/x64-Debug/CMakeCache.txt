@@ -20,8 +20,8 @@ CMAKE_AR:FILEPATH=C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools
 //No help, variable specified on the command line.
 CMAKE_BUILD_TYPE:STRING=Debug
 
-//CXX compiler
-CMAKE_CXX_COMPILER:STRING=C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe
+//No help, variable specified on the command line.
+CMAKE_CXX_COMPILER:FILEPATH=C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe
 
 //Flags used by the CXX compiler during all build types.
 CMAKE_CXX_FLAGS:STRING=/DWIN32 /D_WINDOWS /GR /EHsc
@@ -97,6 +97,9 @@ CMAKE_MODULE_LINKER_FLAGS_RELEASE:STRING=/INCREMENTAL:NO
 // RELWITHDEBINFO builds.
 CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO:STRING=/debug /INCREMENTAL
 
+//MSVC 运行库：静态(/MT) 或动态(/MD)
+CMAKE_MSVC_RUNTIME_LIBRARY:STRING=MultiThreaded$<$<CONFIG:Debug>:Debug>
+
 //Path to a program.
 CMAKE_MT:FILEPATH=C:/Program Files (x86)/Windows Kits/10/bin/10.0.26100.0/x64/mt.exe
 
@@ -116,16 +119,16 @@ CMAKE_PROJECT_NAME:STATIC=EHsc
 CMAKE_PROJECT_SPDX_LICENSE:STATIC=
 
 //Value Computed by CMake
-CMAKE_PROJECT_VERSION:STATIC=2.0.0
+CMAKE_PROJECT_VERSION:STATIC=2.1.1
 
 //Value Computed by CMake
 CMAKE_PROJECT_VERSION_MAJOR:STATIC=2
 
 //Value Computed by CMake
-CMAKE_PROJECT_VERSION_MINOR:STATIC=0
+CMAKE_PROJECT_VERSION_MINOR:STATIC=1
 
 //Value Computed by CMake
-CMAKE_PROJECT_VERSION_PATCH:STATIC=0
+CMAKE_PROJECT_VERSION_PATCH:STATIC=1
 
 //Value Computed by CMake
 CMAKE_PROJECT_VERSION_TWEAK:STATIC=
