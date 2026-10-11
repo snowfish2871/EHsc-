@@ -15,10 +15,10 @@
 cmake_minimum_required(VERSION 3.16)
 
 # 版本号：CMake 的 VERSION 字段只接受纯数字，完整版本串单独定义并传给编译器
-set(EHSC_VERSION_STRING "2.1.1")
+set(EHSC_VERSION_STRING "2.1.2Debug")
 
 project(EHsc
-        VERSION 2.1.1
+        VERSION 2.1.2
         DESCRIPTION "纯 C++ 文件哈希 / 校验 / 比较命令行工具（无第三方依赖）"
         LANGUAGES CXX)
 
