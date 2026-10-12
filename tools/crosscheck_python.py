@@ -444,10 +444,13 @@ def main():
             fh.write(b"original")
         watch_report = os.path.join(workdir, "watch_report.json")
 
+        # 注意：这里必须排空/丢弃子进程输出。Windows 匿名管道缓冲区很小
+        # （Python subprocess.PIPE 默认约 4 KB），只 wait() 不读会把子进程写阻塞，
+        # 表现为"监听进程没退出"。测试只关心报告文件，所以直接丢弃。
         watcher = subprocess.Popen(
             [exe, "watch", watch_dir, "--watch", "8", "-o", watch_report, "-f", "json",
              "--no-progress", "--no-elevate"],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2.5)
         # 让一个子进程持有该文件 3 秒并写入：句柄采样应当能抓到它
         helper_code = (
@@ -492,7 +495,7 @@ def main():
         report2 = os.path.join(workdir, "watch_report2.txt")
         proc = subprocess.Popen([exe, "watch", watch_dir, "--watch", "5", "--no-handles",
                                  "-o", report2, "-f", "txt", "--no-progress", "--no-elevate"],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(2)
         with open(watch_file, "ab") as fh:
             fh.write(b"more")
@@ -570,6 +573,80 @@ def main():
         text7 = proc.stdout.decode("utf-8", errors="replace")
         check("无法询问是否提权" in text7, "无数据的管道不应触发提问：\n" + text7)
         print("  无可读输入时不提问（脚本不会被卡住）")
+
+        # 8.8 文件活动（"这个文件被干了什么"）：写入 / 截断 / 改名 / 删除都要能识别并归因
+        print("\n[8.8] 文件活动时间线（它被干了什么）")
+        act_dir = os.path.join(workdir, "activity")
+        os.makedirs(act_dir, exist_ok=True)
+        act_file = os.path.join(act_dir, "audit.bin")
+        act_report = os.path.join(workdir, "activity.json")
+        with open(act_file, "wb") as fh:
+            fh.write(b"seed")
+        act_watcher = subprocess.Popen(
+            [exe, "watch", act_dir, "--watch", "10", "-o", act_report, "-f", "json",
+             "--no-progress", "--no-elevate"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(2)
+        helper_code = (
+            "import time\n"
+            "f = open(r'%s', 'r+b')\n"
+            "f.seek(0, 2)\n"
+            "f.write(b'APPENDED-DATA')\n"
+            "f.flush()\n"
+            "time.sleep(2)\n"
+            "f.truncate(4)\n"
+            "f.flush()\n"
+            "time.sleep(2)\n"
+            "f.close()\n" % act_file)
+        helper = subprocess.Popen([sys.executable, "-c", helper_code],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        helper.wait(timeout=30)
+        time.sleep(1)
+        renamed = os.path.join(act_dir, "renamed.bin")
+        os.replace(act_file, renamed)
+        time.sleep(1)
+        os.remove(renamed)
+        try:
+            act_watcher.wait(timeout=60)
+        except subprocess.TimeoutExpired:
+            act_watcher.kill()
+            check(False, "活动监听应在 --watch 到期后自行退出")
+
+        check(os.path.isfile(act_report), "活动审计未生成报告")
+        if os.path.isfile(act_report):
+            with open(act_report, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            acts = data.get("activities", [])
+            kinds = [a.get("activity") for a in acts]
+            check(len(acts) >= 3, "应记录到多次活动（实际 %d 条: %s）" % (len(acts), kinds))
+            check("written" in kinds, "应记录写入活动，实际: %s" % kinds)
+            check("truncated" in kinds, "应记录截断活动，实际: %s" % kinds)
+            check("renamed" in kinds, "应记录改名活动，实际: %s" % kinds)
+            check("deleted" in kinds, "应记录删除活动，实际: %s" % kinds)
+            written = [a for a in acts if a.get("activity") == "written"]
+            if written:
+                check(written[0].get("sizeAfter", 0) > written[0].get("sizeBefore", 0),
+                      "写入活动应记录大小增长：%s" % written[0])
+                digest_changed = [a for a in acts if a.get("digestChanged") is True]
+                check(bool(digest_changed), "至少应有一条活动标记出内容摘要变化")
+            attributed = [a for a in acts if a.get("pid")]
+            check(bool(attributed), "持有期间的活动应能归因到进程")
+            if attributed:
+                print("  归因示例: %s (pid %s)" %
+                      (attributed[0].get("process"), attributed[0].get("pid")))
+            print("  活动类型: %s" % ", ".join(kinds))
+
+        # 8.9 菜单里的「文件活动审计」入口（纯活动模式，不询问提权）
+        audit_report = os.path.join(workdir, "menu_activity.json")
+        menu_in = ("11\r\n" + act_dir + "\r\n3\r\ny\r\n3\r\n" + audit_report +
+                   "\r\n\r\n0\r\n").encode("utf-8")
+        proc = subprocess.run([exe], input=menu_in, capture_output=True, timeout=150)
+        menu_out = proc.stdout.decode("utf-8", errors="replace")
+        check("请输入要审计的文件或文件夹" in menu_out,
+              "菜单应提供「文件活动审计」入口：\n" + menu_out[-600:])
+        check("是否以管理员身份" not in menu_out, "纯活动审计不应询问提权（不需要管理员）")
+        check(os.path.isfile(audit_report), "菜单活动审计应生成报告")
+        print("  菜单入口 11) 文件活动审计：不询问提权、报告正常生成")
 
         # ------------------------------------------------------ 9. 退出码 --
         print("\n[9] 自检退出码")

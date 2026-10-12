@@ -13,6 +13,7 @@ namespace {
 struct Screen {
     int width = 0;
     int rows = 0;
+    int top = 0;   // 窗口在缓冲区中的起始行（点击坐标必须用绝对行号）
     std::vector<std::wstring> lines;
 };
 
@@ -35,8 +36,9 @@ bool readScreen(Screen& screen) {
     GetConsoleScreenBufferInfo(conout, &info);
     screen.width = info.dwSize.X;
     screen.rows = info.srWindow.Bottom - info.srWindow.Top + 1;
+    screen.top = info.srWindow.Top;   // 窗口可能已滚动，必须用缓冲区绝对行号
     screen.lines.clear();
-    for (int y = 0; y < screen.rows; ++y) {
+    for (int y = screen.top; y < screen.top + screen.rows; ++y) {
         std::vector<wchar_t> buffer(static_cast<size_t>(screen.width) + 1, L'\0');
         DWORD read = 0;
         COORD pos{0, static_cast<SHORT>(y)};
@@ -73,7 +75,7 @@ int findRow(const Screen& screen, const std::wstring& needle, int& column) {
         const size_t at = line.find(needle);
         if (at != std::wstring::npos) {
             column = displayWidth(line.substr(0, at));   // 换算成显示列
-            return y;
+            return screen.top + y;                       // 换成缓冲区绝对行号
         }
     }
     return -1;
@@ -168,6 +170,25 @@ int wmain(int argc, wchar_t** argv) {
         std::printf("AttachConsole failed: %lu\n", GetLastError());
         TerminateProcess(pi.hProcess, 0);
         return 1;
+    }
+
+    // 可选：把被测程序的控制台调成指定宽度（验证窄控制台下的点击是否仍然对齐）
+    {
+        wchar_t cols[16] = {0};
+        const DWORD len = GetEnvironmentVariableW(L"EHSC_MOUSE_COLS", cols, 16);
+        if (len > 0 && len < 16) {
+            const int want = _wtoi(cols);
+            HANDLE co = CreateFileW(L"CONOUT$", GENERIC_READ | GENERIC_WRITE,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0,
+                                    nullptr);
+            if (co != INVALID_HANDLE_VALUE && want > 20) {
+                SMALL_RECT win{0, 0, static_cast<SHORT>(want - 1), 29};
+                SetConsoleWindowInfo(co, TRUE, &win);
+                COORD size{static_cast<SHORT>(want), 400};
+                SetConsoleScreenBufferSize(co, size);
+                CloseHandle(co);
+            }
+        }
     }
 
     Screen screen;
