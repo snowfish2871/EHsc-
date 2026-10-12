@@ -10,6 +10,7 @@
 //    * Windows 的目录变更通知不提供发起进程，因此这类事件只能记录"何时被改"。
 // ============================================================================
 #include "watch.h"
+#include "core.h"
 #include "hashes.h"
 #include "win32_utils.h"
 
@@ -322,6 +323,30 @@ bool FileActivityMonitor::start(std::wstring& err) {
     stopFlag_.store(false);
     running_.store(true);
 
+    // 活动追踪：先给每个已存在的目标文件拍一张"起点快照"，
+    // 之后任何变化都能和它对比，回答"这个文件被干了什么"。
+    if (options_.trackActivity) {
+        for (const TargetInfo& target : targets_) {
+            if (target.isDir) continue;
+            FileSnapshot snap;
+            if (takeSnapshot(target.path, options_.digestContent, snap)) {
+                snapshots_[toLower(target.path)] = snap;
+            }
+            trackedPaths_.push_back(target.path);
+        }
+        if (options_.notifyChanges || true) {
+            // 目录目标：把目录里已有的文件也纳入"定时快照对比"的范围。
+            // 原因：ReadDirectoryChangesW 只报告"目录项变化"，对已经打开的句柄
+            // 继续写入/截断往往不产生新通知（实测 3 次操作只来 1 条事件），
+            // 所以必须自己按间隔去比对文件本身的大小/时间/摘要。
+            for (const TargetInfo& target : targets_) {
+                if (!target.isDir) continue;
+                collectTrackedFiles(target.path, target.path.size() + 1);
+            }
+        }
+        activityThread_ = std::thread([this] { activityLoop(); });
+    }
+
     if (options_.pollHandles) {
         handleThread_ = std::thread([this] { handleLoop(); });
     }
@@ -341,6 +366,8 @@ void FileActivityMonitor::stop() {
     }
     stopFlag_.store(true);
     if (cancelEvent_) SetEvent(static_cast<HANDLE>(cancelEvent_));
+    activityRequested_.store(true);
+    if (activityThread_.joinable()) activityThread_.join();
     if (handleThread_.joinable()) handleThread_.join();
     for (std::thread& thread : notifyThreads_) {
         if (thread.joinable()) thread.join();
@@ -443,21 +470,374 @@ void FileActivityMonitor::mergeAccess(const AccessRecord& record) {
 }
 
 void FileActivityMonitor::appendChanges(std::vector<ChangeRecord>&& items) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    for (ChangeRecord& item : items) {
-        if (changes_.size() >= options_.maxRecords) break;
-        changes_.push_back(item);
-        pendingChange_.push_back(item);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (ChangeRecord& item : items) {
+            if (changes_.size() >= options_.maxRecords) break;
+            changes_.push_back(item);
+            pendingChange_.push_back(item);
+            if (options_.trackActivity) pendingChangeForActivity_.push_back(item);
+        }
+        if (items.empty()) return;
     }
+    stats_.changeEvents = changes_.size();
+    // 变更事件一到就让活动线程立刻补一次快照对比（"变了" → "改了什么"）
+    if (options_.trackActivity) activityRequested_.store(true);
 }
 
 void FileActivityMonitor::drain(std::vector<AccessRecord>& newAccesses,
-                                std::vector<ChangeRecord>& newChanges) {
+                                std::vector<ChangeRecord>& newChanges,
+                                std::vector<ActivityRecord>& newActivities) {
     std::lock_guard<std::mutex> lock(mutex_);
     newAccesses.swap(pendingAccess_);
     newChanges.swap(pendingChange_);
+    newActivities.swap(pendingActivity_);
     pendingAccess_.clear();
     pendingChange_.clear();
+    pendingActivity_.clear();
+}
+
+// ============================================================ 活动追踪 ====
+// 目标：把文件系统给的"变了"翻译成人能读的"被干了什么"。
+// 做法：每次变化都对文件拍一张快照（大小 / 修改时间 / 属性 / 可选的内容摘要），
+//       和上一次快照对比得出活动类型；再查一次句柄表，看当时是谁拿着它 —— 那就是"谁干的"。
+bool FileActivityMonitor::takeSnapshot(const std::wstring& path, bool withDigest,
+                                       FileSnapshot& out) const {
+    out = FileSnapshot{};
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data)) {
+        return false;   // 不存在或没有权限
+    }
+    out.exists = true;
+    out.attributes = data.dwFileAttributes;
+    out.size = (static_cast<uint64_t>(data.nFileSizeHigh) << 32) | data.nFileSizeLow;
+    ULARGE_INTEGER ticks{};
+    ticks.HighPart = data.ftLastWriteTime.dwHighDateTime;
+    ticks.LowPart = data.ftLastWriteTime.dwLowDateTime;
+    out.mtime = static_cast<int64_t>(ticks.QuadPart / 10000000ull) - 11644473600ll;
+
+    if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        out.digestValid = false;
+        return true;
+    }
+
+    if (!withDigest || out.size > options_.digestMaxBytes) return true;
+    // 内容摘要：用 SHA-256 证明"内容确实变了"，而不是只凭大小/时间猜测
+    std::wstring err;
+    const SingleHashResult hashed = hashSingleFile(path, {Algo::SHA256}, 1u << 20, true, nullptr,
+                                                   false, 1);
+    if (hashed.ok && !hashed.digests.empty()) {
+        out.digest = hashed.digests.front();
+        out.digestValid = true;
+    }
+    (void)err;
+    return true;
+}
+
+void FileActivityMonitor::emitActivity(const std::wstring& path, const FileSnapshot& before,
+                                       const FileSnapshot& after, ActivityKind kind,
+                                       const std::wstring& newPath, int64_t timeMs) {
+    ActivityRecord record;
+    record.timeMs = timeMs > 0 ? timeMs : nowMs();
+    record.kind = kind;
+    record.path = path;
+    record.newPath = newPath;
+    record.before = before;
+    record.after = after;
+    if (before.digestValid && after.digestValid) {
+        record.digestComputed = true;
+        record.digestChanged = before.digest != after.digest;
+    }
+    // 归因：查一次谁正持有这个文件
+    attributeProcess(path, record.pid, record.processName, record.op);
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (activities_.size() >= options_.maxRecords) return;
+    activities_.push_back(record);
+    pendingActivity_.push_back(record);
+    stats_.activityRecords = activities_.size();
+    if (record.pid != 0) ++stats_.activitiesWithProcess;
+}
+
+// 在当前句柄采样结果里找"谁持有这个文件"，取访问权限最强的那一个
+bool FileActivityMonitor::attributeProcess(const std::wstring& path, uint32_t& pid,
+                                           std::wstring& name, WatchOp& op) {
+    const std::wstring lower = toLower(path);
+    auto search = [&]() -> bool {
+        std::lock_guard<std::mutex> lock(mutex_);
+        bool found = false;
+        for (const AccessRecord& access : accesses_) {
+            if (toLower(access.filePath) != lower) continue;
+            if (!found || opStrength(access.op) > opStrength(op)) {
+                pid = access.pid;
+                name = access.processName;
+                op = access.op;
+                found = true;
+            }
+        }
+        return found;
+    };
+    if (search()) return true;
+
+    // 兜底：活动是稀有事件，这里补一次句柄采样再匹配一次。
+    // "刚创建/刚写完就关句柄"的程序往往正好躲过定时采样，补扫能显著提高归因率。
+    if (options_.pollHandles && stats_.handleScanAvailable) {
+        std::vector<AccessRecord> fresh;
+        {
+            std::lock_guard<std::mutex> scanLock(scanMutex_);
+            scanHandles(fresh);
+            for (const AccessRecord& record : fresh) mergeAccess(record);
+        }
+        if (search()) return true;
+    }
+    return false;
+}
+
+// 目录变更事件 → 活动记录：立即补一次快照对比，让"改了"变成"改了什么"
+void FileActivityMonitor::trackChanges(const std::vector<ChangeRecord>& source) {
+    // Windows 的一次改名会发出两条记录（先是 OLD、再是 NEW），这里把它们配成一条
+    // "改名为 xxx" 的活动；配不上对的 OLD 仍按改名处理（只是拿不到新名字）。
+    std::wstring pendingRenameFrom;
+    auto emitRename = [&](const std::wstring& from, const std::wstring& to, int64_t timeMs) {
+        FileSnapshot before;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = snapshots_.find(toLower(from));
+            if (it != snapshots_.end()) before = it->second;
+        }
+        FileSnapshot after;
+        takeSnapshot(from, options_.digestContent, after);
+        emitActivity(from, before, after, ActivityKind::Renamed, to, timeMs);
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshots_.erase(toLower(from));
+        if (!to.empty()) {
+            FileSnapshot moved;
+            if (takeSnapshot(to, options_.digestContent, moved)) snapshots_[toLower(to)] = moved;
+        }
+    };
+
+    for (const ChangeRecord& change : source) {
+        if (change.kind == ChangeKind::RenamedNew) {
+            if (!pendingRenameFrom.empty()) {
+                emitRename(pendingRenameFrom, change.path, change.timeMs);
+                pendingRenameFrom.clear();
+            }
+            continue;
+        }
+        if (change.kind == ChangeKind::RenamedOld) {
+            if (!pendingRenameFrom.empty()) emitRename(pendingRenameFrom, std::wstring(), 0);
+            pendingRenameFrom = change.path;
+            continue;
+        }
+        if (!pendingRenameFrom.empty()) {
+            emitRename(pendingRenameFrom, std::wstring(), 0);
+            pendingRenameFrom.clear();
+        }
+
+        const std::wstring key = toLower(change.path);
+        FileSnapshot before;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto it = snapshots_.find(key);
+            if (it != snapshots_.end()) before = it->second;
+        }
+
+        FileSnapshot after;
+        const bool exists = takeSnapshot(change.path, options_.digestContent, after);
+
+        ActivityKind kind = ActivityKind::ContentWritten;
+        switch (change.kind) {
+            case ChangeKind::Added:
+                kind = before.exists ? ActivityKind::ContentWritten : ActivityKind::Created;
+                break;
+            case ChangeKind::Removed:
+                kind = ActivityKind::Deleted;
+                break;
+            case ChangeKind::RenamedOld:
+                kind = ActivityKind::Renamed;
+                break;
+            case ChangeKind::AttrChanged:
+                kind = (before.exists && after.exists && before.attributes != after.attributes)
+                           ? ActivityKind::AttributesChanged
+                           : ActivityKind::TimestampsChanged;
+                break;
+            case ChangeKind::Modified:
+            default:
+                if (before.exists && exists) {
+                    if (after.size > before.size) {
+                        kind = ActivityKind::ContentWritten;
+                    } else if (after.size < before.size) {
+                        kind = ActivityKind::Truncated;
+                    } else if (before.digestValid && after.digestValid) {
+                        // 大小没变：靠摘要区分"真的改写了"和"只是动了时间戳"
+                        kind = before.digest != after.digest ? ActivityKind::Rewritten
+                                                             : ActivityKind::TimestampsChanged;
+                    } else if (before.mtime != after.mtime) {
+                        kind = ActivityKind::Rewritten;   // 没算摘要时只能保守判定
+                    } else {
+                        kind = ActivityKind::TimestampsChanged;
+                    }
+                } else {
+                    kind = exists ? ActivityKind::Created : ActivityKind::Deleted;
+                }
+                break;
+        }
+
+        // 内容摘要能给出更准确的判断
+        FileSnapshot digestBefore = before;
+        FileSnapshot digestAfter = after;
+        if (before.exists && exists && options_.digestContent) {
+            if (!digestBefore.digestValid) {
+                takeSnapshot(change.path, true, digestBefore);   // 现算一次
+            }
+        }
+        (void)digestAfter;
+
+        emitActivity(change.path, before, after, kind, change.newPath, change.timeMs);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (exists) {
+                snapshots_[key] = after;
+            } else {
+                snapshots_.erase(key);
+            }
+            if (change.kind == ChangeKind::RenamedOld && !change.newPath.empty()) {
+                FileSnapshot moved;
+                if (takeSnapshot(change.newPath, options_.digestContent, moved)) {
+                    snapshots_[toLower(change.newPath)] = moved;
+                }
+            }
+        }
+    }
+}
+
+void FileActivityMonitor::activityLoop() {
+    const int interval = options_.activityIntervalMs > 0 ? options_.activityIntervalMs : 250;
+    while (!stopFlag_.load()) {
+        // 目录事件已经触发了对比就立即做，否则按固定间隔轮询（文件目标也能被发现变化）
+        for (int waited = 0; waited < interval && !stopFlag_.load(); waited += 50) {
+            if (activityRequested_.exchange(false)) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+        if (stopFlag_.load()) break;
+
+        // ① 目录变更事件 → 活动
+        std::vector<ChangeRecord> pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending.swap(pendingChangeForActivity_);
+        }
+        if (!pending.empty()) trackChanges(pending);
+
+        // ② 逐个比对"被跟踪的文件"：文件目标 + 监听目录里已登记的文件。
+        //    目录通知对"已打开句柄继续写入/截断"经常不漏报，这一步是活动识别的主力。
+        std::vector<std::wstring> batch;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            const size_t total = trackedPaths_.size();
+            if (total > 0) {
+                const size_t perTick = total > 256 ? 256 : total;   // 超大目录分批轮询
+                for (size_t i = 0; i < perTick; ++i) {
+                    batch.push_back(trackedPaths_[(pollCursor_ + i) % total]);
+                }
+                pollCursor_ = (pollCursor_ + perTick) % total;
+            }
+        }
+        for (const std::wstring& path : batch) {
+            if (stopFlag_.load()) break;
+            pollPath(path);
+        }
+    }
+}
+
+void FileActivityMonitor::refreshSnapshot(const std::wstring& path, bool digestHint) {
+    FileSnapshot snap;
+    if (takeSnapshot(path, digestHint, snap)) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        snapshots_[toLower(path)] = snap;
+    }
+}
+
+// 把目录里已有的文件纳入定时快照对比（带数量上限，避免超大目录拖慢启动）
+void FileActivityMonitor::collectTrackedFiles(const std::wstring& dir, size_t prefixLength) {
+    constexpr size_t kMaxTracked = 4096;
+    std::vector<DirEntry> entries;
+    std::wstring err;
+    if (!listDirectory(dir, entries, err)) return;
+    for (const DirEntry& entry : entries) {
+        if (trackedPaths_.size() >= kMaxTracked) return;
+        const std::wstring lower = toLower(entry.fullPath);
+        if (entry.isDir) {
+            // 递归进子目录，跳过符号链接/联接点避免循环
+            if (options_.recursive && (entry.attributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0) {
+                collectTrackedFiles(entry.fullPath, prefixLength);
+            }
+            continue;
+        }
+        if (!options_.filters.empty() && !matchesFilter(lower)) continue;
+        trackedPaths_.push_back(entry.fullPath);
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (snapshots_.find(lower) != snapshots_.end()) continue;
+        FileSnapshot snap;
+        if (takeSnapshot(entry.fullPath, false, snap)) snapshots_[lower] = snap;   // 起点不摘要，快
+    }
+}
+
+// 比对单个文件：发现变化就产出活动记录（这是"通知漏报"情况下的主要依靠）
+void FileActivityMonitor::pollPath(const std::wstring& path) {
+    const std::wstring key = toLower(path);
+    FileSnapshot before;
+    bool hasBefore = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = snapshots_.find(key);
+        if (it != snapshots_.end()) {
+            before = it->second;
+            hasBefore = true;
+        }
+    }
+    FileSnapshot after;
+    const bool exists = takeSnapshot(path, options_.digestContent, after);
+    if (!hasBefore) {
+        if (exists) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            snapshots_[key] = after;
+        }
+        return;
+    }
+    const bool changed =
+        before.exists != exists ||
+        (exists && (before.size != after.size || before.mtime != after.mtime ||
+                    before.attributes != after.attributes ||
+                    (before.digestValid && after.digestValid && before.digest != after.digest)));
+    if (!changed) return;
+
+    ActivityKind kind = ActivityKind::ContentWritten;
+    if (!exists) {
+        kind = ActivityKind::Deleted;
+    } else if (!before.exists) {
+        kind = ActivityKind::Created;
+    } else if (after.size > before.size) {
+        kind = ActivityKind::ContentWritten;
+    } else if (after.size < before.size) {
+        kind = ActivityKind::Truncated;
+    } else if (before.attributes != after.attributes) {
+        kind = ActivityKind::AttributesChanged;
+    } else if (before.digestValid && after.digestValid && before.digest != after.digest) {
+        kind = ActivityKind::Rewritten;
+    } else {
+        kind = ActivityKind::TimestampsChanged;
+    }
+    emitActivity(path, before, after, kind, std::wstring(), 0);
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (exists) {
+            snapshots_[key] = after;
+        } else {
+            snapshots_.erase(key);
+        }
+    }
 }
 
 // ------------------------------------------------------------ 句柄扫描 --
@@ -644,8 +1024,12 @@ void FileActivityMonitor::handleLoop() {
     while (!stopFlag_.load()) {
         scanRequested_.store(false);
         std::vector<AccessRecord> fresh;
-        scanHandles(fresh);
-        for (const AccessRecord& record : fresh) mergeAccess(record);
+        {
+            // 整轮扫描会改写句柄/进程缓存，和"活动归因时的补扫"互斥
+            std::lock_guard<std::mutex> scanLock(scanMutex_);
+            scanHandles(fresh);
+            for (const AccessRecord& record : fresh) mergeAccess(record);
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             stats_.samples++;
@@ -768,6 +1152,7 @@ WatchResult FileActivityMonitor::snapshot() {
         std::lock_guard<std::mutex> lock(mutex_);
         result.accesses = accesses_;
         result.changes = changes_;
+        result.activities = activities_;
         result.stats = stats_;
         std::set<uint32_t> pids;
         std::set<std::wstring> files;
@@ -832,6 +1217,112 @@ std::string jsonField(const std::wstring& text) {
 }
 }  // namespace
 
+namespace {
+// 把文件属性位翻译成简短中文，用于"属性变更"活动
+std::string attributeText(uint32_t attributes) {
+    if (attributes == 0) return "无";
+    std::string text;
+    auto add = [&text](const char* name) {
+        if (!text.empty()) text += "+";
+        text += name;
+    };
+    if (attributes & FILE_ATTRIBUTE_READONLY)  add("只读");
+    if (attributes & FILE_ATTRIBUTE_HIDDEN)    add("隐藏");
+    if (attributes & FILE_ATTRIBUTE_SYSTEM)    add("系统");
+    if (attributes & FILE_ATTRIBUTE_ARCHIVE)   add("存档");
+    if (attributes & FILE_ATTRIBUTE_TEMPORARY) add("临时");
+    if (attributes & FILE_ATTRIBUTE_SPARSE_FILE) add("稀疏");
+    if (attributes & FILE_ATTRIBUTE_COMPRESSED) add("压缩");
+    if (attributes & FILE_ATTRIBUTE_ENCRYPTED) add("加密");
+    return text.empty() ? "其它" : text;
+}
+}  // namespace
+const char* activityKindName(ActivityKind kind) {
+    switch (kind) {
+        case ActivityKind::Created:           return "created";
+        case ActivityKind::ContentWritten:    return "written";
+        case ActivityKind::Truncated:         return "truncated";
+        case ActivityKind::Rewritten:         return "rewritten";
+        case ActivityKind::Deleted:           return "deleted";
+        case ActivityKind::Renamed:           return "renamed";
+        case ActivityKind::AttributesChanged: return "attributes";
+        case ActivityKind::TimestampsChanged: return "timestamps";
+        case ActivityKind::Lost:              return "lost";
+    }
+    return "unknown";
+}
+const char* activityKindDisplay(ActivityKind kind) {
+    switch (kind) {
+        case ActivityKind::Created:           return "新建文件";
+        case ActivityKind::ContentWritten:    return "写入内容";
+        case ActivityKind::Truncated:         return "截断内容";
+        case ActivityKind::Rewritten:         return "原地改写";
+        case ActivityKind::Deleted:           return "删除文件";
+        case ActivityKind::Renamed:           return "改名";
+        case ActivityKind::AttributesChanged: return "属性变更";
+        case ActivityKind::TimestampsChanged: return "时间戳变更";
+        case ActivityKind::Lost:              return "失去访问";
+    }
+    return "未知活动";
+}
+
+// 一行说清"干了什么"：大小变化 + 摘要是否变化 + 是谁干的
+std::string describeActivityBrief(const ActivityRecord& record) {
+    std::string text;
+    const FileSnapshot& before = record.before;
+    const FileSnapshot& after = record.after;
+
+    switch (record.kind) {
+        case ActivityKind::Created:
+            text = "新建，初始 " + formatByteSize(after.size);
+            break;
+        case ActivityKind::Deleted: {
+            text = "删除（原大小 " + formatByteSize(before.size) + "）";
+            break;
+        }
+        case ActivityKind::Renamed: {
+            text = "改名为 " + wideToUtf8(baseName(record.newPath));
+            break;
+        }
+        case ActivityKind::AttributesChanged: {
+            text = "属性 " + attributeText(before.attributes) + " → " + attributeText(after.attributes);
+            break;
+        }
+        case ActivityKind::Truncated: {
+            text = "大小 " + formatByteSize(before.size) + " → " + formatByteSize(after.size) + "（-" +
+                   formatByteSize(before.size - after.size) + "）";
+            break;
+        }
+        case ActivityKind::ContentWritten: {
+            const uint64_t grew = after.size > before.size ? after.size - before.size : 0;
+            text = "大小 " + formatByteSize(before.size) + " → " + formatByteSize(after.size);
+            if (grew > 0) text += "（+" + formatByteSize(grew) + "）";
+            break;
+        }
+        case ActivityKind::Rewritten: {
+            text = "大小不变（" + formatByteSize(after.size) + "）";
+            break;
+        }
+        case ActivityKind::TimestampsChanged: {
+            text = "只有修改时间变化（大小仍为 " + formatByteSize(after.size) + "）";
+            break;
+        }
+        case ActivityKind::Lost: {
+            text = "监听期间失去访问权";
+            break;
+        }
+    }
+    if (record.digestComputed) {
+        text += record.digestChanged ? "；内容摘要已变化" : "；内容摘要未变";
+    }
+    if (!record.processName.empty()) {
+        text += "；当时持有者 " + wideToUtf8(record.processName) + " (pid " +
+                std::to_string(record.pid) + "，" + watchOpDisplay(record.op) + ")";
+    } else if (record.pid == 0 && record.kind != ActivityKind::Deleted) {
+        text += "；未捕捉到持有进程（瞬时操作或权限不足）";
+    }
+    return text;
+}
 std::string buildWatchReport(const WatchResult& result, OutFormat format) {
     std::string out;
     const WatchStats& stats = result.stats;
@@ -857,7 +1348,10 @@ std::string buildWatchReport(const WatchResult& result, OutFormat format) {
                ", \"changeEvents\": " + std::to_string(stats.changeEvents) +
                ", \"processes\": " + std::to_string(stats.processes) +
                ", \"files\": " + std::to_string(stats.files) +
-               ", \"samples\": " + std::to_string(stats.samples) + "},\n";
+               ", \"samples\": " + std::to_string(stats.samples) +
+               ", \"activityRecords\": " + std::to_string(stats.activityRecords) +
+               ", \"activitiesWithProcess\": " + std::to_string(stats.activitiesWithProcess) +
+               "},\n";
         out += "  \"accesses\": [\n";
         for (size_t i = 0; i < result.accesses.size(); ++i) {
             const AccessRecord& record = result.accesses[i];
@@ -885,6 +1379,30 @@ std::string buildWatchReport(const WatchResult& result, OutFormat format) {
             if (i + 1 < result.changes.size()) out += ",";
             out += "\n";
         }
+        out += "  ],\n  \"activities\": [\n";
+        for (size_t i = 0; i < result.activities.size(); ++i) {
+            const ActivityRecord& record = result.activities[i];
+            out += "    {\"time\": \"" + formatTimeMs(record.timeMs) + "\", \"activity\": \"" +
+                   activityKindName(record.kind) + "\", \"description\": \"" +
+                   jsonField(utf8ToWide(describeActivityBrief(record))) + "\", \"path\": \"" +
+                   jsonField(record.path) + "\"";
+            if (!record.newPath.empty()) out += ", \"newPath\": \"" + jsonField(record.newPath) + "\"";
+            out += ", \"sizeBefore\": " + std::to_string(record.before.size) +
+                   ", \"sizeAfter\": " + std::to_string(record.after.size) +
+                   ", \"existedBefore\": " + (record.before.exists ? "true" : "false") +
+                   ", \"existsAfter\": " + (record.after.exists ? "true" : "false");
+            if (record.digestComputed) {
+                out += ", \"digestBefore\": \"" + jsonField(utf8ToWide(record.before.digest)) + "\"";
+                out += ", \"digestAfter\": \"" + jsonField(utf8ToWide(record.after.digest)) + "\"";
+                out += ", \"digestChanged\": " +
+                       std::string(record.digestChanged ? "true" : "false");
+            }
+            out += ", \"pid\": " + std::to_string(record.pid) + ", \"process\": \"" +
+                   jsonField(record.processName) + "\", \"operation\": \"" + watchOpName(record.op) +
+                   "\"}";
+            if (i + 1 < result.activities.size()) out += ",";
+            out += "\n";
+        }
         out += "  ]\n}\n";
         return out;
     }
@@ -893,17 +1411,31 @@ std::string buildWatchReport(const WatchResult& result, OutFormat format) {
         out += "# EHsc 文件访问监听报告 v" + std::string(versionString()) + " 生成于 " +
                isoNowUtc() + "\n";
         out += "# 权限: " + wideToUtf8(stats.note) + "\n";
-        out += "Type,Time,EndTime,PID,Process,Operation,Path,NewPath,DurationMs,Samples,AccessMask\n";
+        out += "Type,Time,EndTime,PID,Process,Operation,Path,NewPath,DurationMs,Samples,AccessMask,"
+               "SizeBefore,SizeAfter,DigestBefore,DigestAfter,Note\n";
         for (const AccessRecord& record : result.accesses) {
             out += "Access," + formatTimeMs(record.firstSeenMs) + "," + formatTimeMs(record.lastSeenMs) +
                    "," + std::to_string(record.pid) + "," + csvField(record.processName) + "," +
                    watchOpName(record.op) + "," + csvField(record.filePath) + ",," +
                    std::to_string(record.lastSeenMs - record.firstSeenMs) + "," +
-                   std::to_string(record.samples) + "," + std::to_string(record.accessMask) + "\n";
+                   std::to_string(record.samples) + "," + std::to_string(record.accessMask) +
+                   ",,,,,\n";
         }
         for (const ChangeRecord& record : result.changes) {
             out += "Change," + formatTimeMs(record.timeMs) + ",,0,,," + csvField(record.path) + "," +
-                   csvField(record.newPath) + ",,,\n";
+                   csvField(record.newPath) + ",,,,,,,,\n";
+        }
+        // 活动行：Type=Activity，附带大小变化、摘要变化与归因进程
+        for (const ActivityRecord& record : result.activities) {
+            out += "Activity," + formatTimeMs(record.timeMs) + ",," + std::to_string(record.pid) + "," +
+                   csvField(record.processName) + "," + watchOpName(record.op) + "," +
+                   csvField(record.path) + "," + csvField(record.newPath) + ",,," + "," +
+                   std::to_string(record.before.size) + "," + std::to_string(record.after.size) + "," +
+                   csvField(utf8ToWide(record.before.digest)) + "," +
+                   csvField(utf8ToWide(record.after.digest)) + "," +
+                   csvField(utf8ToWide(std::string(activityKindDisplay(record.kind)) + "；" +
+                                       describeActivityBrief(record))) +
+                   "\n";
         }
         return out;
     }
@@ -948,6 +1480,16 @@ std::string buildWatchReport(const WatchResult& result, OutFormat format) {
                padToWidth(changeKindDisplay(record.kind), 10) + wideToUtf8(record.path);
         if (!record.newPath.empty()) out += "  ->  " + wideToUtf8(record.newPath);
         out += "\n";
+    }
+    out += "#\n# === 文件活动时间线（这个文件被干了什么）: " +
+           std::to_string(result.activities.size()) + " 条 ===\n";
+    if (result.activities.empty()) {
+        out += "#   （监听期间目标文件没有发生可识别的变化）\n";
+    }
+    for (const ActivityRecord& record : result.activities) {
+        out += "[" + formatTimeMs(record.timeMs) + "]  " +
+               padToWidth(activityKindDisplay(record.kind), 12) + wideToUtf8(record.path) + "\n";
+        out += "         " + describeActivityBrief(record) + "\n";
     }
     return out;
 }

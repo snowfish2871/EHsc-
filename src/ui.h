@@ -93,6 +93,40 @@ int askMenuChoice(const std::string& prompt, int low, int high, int defaultValue
 // 一行式选项菜单（例如"清单格式 1) 文本 2) CSV 3) JSON"），每个选项都可点击。
 int askOptionRow(const std::string& title,
                  const std::vector<std::pair<int, std::string>>& options, int defaultValue);
+
+// ------------------------------------------------- 框线风格界面（█ ═ ╭─╮）----
+struct BoxMenuItem {
+    int         value = 0;
+    std::string label;            // 主标题
+    std::string hint;             // 右侧说明（可空）
+    bool        accent = false;   // 是否用高亮色
+};
+
+// 顶部标题框：╭───╮ │ ◈ EHsc … v3.0.1 │ ╰───╯
+void printAppHeader(const std::string& subtitle);
+// 进入功能页：清掉上一屏（只在真实终端里）并画顶部标题框，
+// 这样上一个功能的界面不会残留在控制台里。
+void beginFunctionScreen(const std::string& title);
+// 带框内容面板：╭─ 标题 ────╮ 多行内容 ╰────────╯
+void printPanel(const std::string& title, const std::vector<std::string>& lines);
+// 复选 / 单选标记（用于开关项与单选组）
+std::string checkMark(bool on);   // [■] / [ ]
+std::string radioMark(bool on);   // (●) / (○)
+// 复选列表：↑↓ 移动、空格/数字键切换、A 全选、N 全不选、ENTER 确认、Esc 取消。
+// items 传入初值，返回后 checked 里是结果；返回 false 表示取消。
+bool runCheckList(const std::string& title, const std::vector<std::string>& labels,
+                  std::vector<bool>& checked, const std::string& hint = std::string());
+// 按钮式二选一（是/否）：←→ 或鼠标选择，ENTER 确认
+bool askButtonYesNo(const std::string& question, bool defaultValue);
+// 状态行：`  标签       值`（标签按显示宽度对齐）
+void printStatusRow(const std::string& label, const std::string& value);
+// 可导航菜单：↑↓ 选择、ENTER 确认、数字键直选、Esc/Q 返回、鼠标可点。
+// 返回选中的值；取消/返回时返回 defaultValue。
+// 输入被重定向时自动退回"打印编号列表 + 读一行"，脚本行为不变。
+int runBoxMenu(const std::string& title, const std::vector<BoxMenuItem>& items, int defaultValue);
+// 横向框线选项（如 1) 文本 2) CSV 3) JSON），当前项用 ╔═╗ 高亮
+int askBoxOptions(const std::string& title,
+                  const std::vector<std::pair<int, std::string>>& options, int defaultValue);
 void pauseForEnter(const std::string& hint = "按回车键返回主菜单…");
 // 输入路径；允许分号分隔多个；输入为空时调用 Windows 原生选择器
 std::vector<std::wstring> askTargets(const std::string& prompt, bool multiple, bool folderMode);
@@ -169,6 +203,8 @@ struct WatchRunOptions {
     bool                      recursive = true;
     bool                      pollHandles = true;
     bool                      notifyChanges = true;
+    bool                      trackActivity = true;   // 记录“它被干了什么”
+    bool                      digestContent = true;   // 内容变化时用摘要证明
     bool                      includeSelf = false;
     uint32_t                  onlyPid = 0;
     size_t                    maxRecords = 20000;

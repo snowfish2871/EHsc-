@@ -351,6 +351,7 @@ ConsoleEvent pollConsoleEvent() {
                 continue;   // 非 ASCII（中文输入等）忽略
             }
             const WORD vk = record.Event.KeyEvent.wVirtualKeyCode;
+            result.virtualKey = static_cast<int>(vk);
             if (vk == VK_ESCAPE) {
                 result.kind = ConsoleEventKind::Key;
                 result.key = 27;
@@ -361,7 +362,10 @@ ConsoleEvent pollConsoleEvent() {
                 result.key = '\r';
                 return result;
             }
-            continue;   // 其它功能键忽略，继续看后面还有没有可用事件
+            // 方向键等功能键：key = 0，但 virtualKey 有效（供菜单做上下选择）
+            result.kind = ConsoleEventKind::Key;
+            result.key = 0;
+            return result;
         }
 
         if (record.EventType == MOUSE_EVENT) {

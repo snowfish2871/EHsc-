@@ -208,23 +208,33 @@ void showBanner() {
 }
 
 void printSectionTitle(const std::string& title) {
-    std::cout << "\n" << paint("── " + title + " ", Color::Cyan)
-              << paint(std::string(60 > title.size() ? 60 - title.size() : 4, '-'), Color::Gray)
+    int width = consoleColumns();
+    if (width <= 0) width = 80;
+    if (width > 78) width = 78;
+    if (width < 40) width = 40;
+    const int fill = width - 4 - static_cast<int>(textDisplayWidth(title));
+    std::cout << "\n  " << paint("▍", Color::Cyan) << paint(title, Color::Bold) << "\n";
+    std::cout << "  " << paint(std::string(static_cast<size_t>(fill > 4 ? fill : 4), '='),
+                               Color::Gray)
               << "\n";
 }
 
-void printInfo(const std::string& text) { std::cout << paint("· ", Color::Gray) << text << "\n"; }
+void printInfo(const std::string& text) {
+    std::cout << "  " << paint("· ", Color::Gray) << text << "\n";
+}
 void printSuccess(const std::string& text) {
-    std::cout << paint("✔ ", Color::Green) << text << "\n";
+    std::cout << "  " << paint("✔ ", Color::Green) << text << "\n";
 }
 void printWarning(const std::string& text) {
-    std::cout << paint("! ", Color::Yellow) << text << "\n";
+    std::cout << "  " << paint("⚠ ", Color::Yellow) << text << "\n";
 }
-void printError(const std::string& text) { std::cout << paint("✘ ", Color::Red) << text << "\n"; }
+void printError(const std::string& text) {
+    std::cout << "  " << paint("✘ ", Color::Red) << text << "\n";
+}
 
 // ============================================================ 交互输入 ====
 bool readLineUtf8(const std::string& prompt, std::string& line) {
-    std::cout << prompt << std::flush;
+    if (!prompt.empty()) std::cout << "  " << paint("▸ ", Color::Cyan) << prompt << std::flush;
     if (!std::getline(std::cin, line)) {
         line.clear();
         return false;
@@ -446,6 +456,506 @@ int askMenuChoice(const std::string& prompt, int low, int high, int defaultValue
                 std::cout << value << "\n";
                 return value;
             }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+}
+
+// ============================================================ 框线界面 ====
+namespace {
+
+// 界面可用宽度（控制台列数减边距，限制在 46~76 之间，保证中文对齐不乱）
+int boxWidth() {
+    int columns = consoleColumns();
+    if (columns <= 0) columns = 80;
+    int width = columns - 4;   // 两侧留余量，避免贴着右边界触发折行
+    if (width > 76) width = 76;
+    if (width < 46) width = 46;
+    return width;
+}
+
+// 打印一个"逻辑行"，并保证它只占一个屏幕行：
+//   * 超出控制台宽度时按显示宽度（中文算 2 列）截断；
+//   * 返回它实际占用的屏幕行数。
+// 这一步是必需的：只要有一行发生折行，"上移 N 行重绘"的算术就会错位 ——
+// 菜单会一轮轮重复打印、点击区域随之整体错行（窄控制台下尤其明显）。
+int printBoxLine(const std::string& text) {
+    int columns = consoleColumns();
+    if (columns <= 0) columns = 80;
+    const std::string line = truncateToWidth(text, static_cast<size_t>(columns));
+    std::cout << line << "\n";
+    const size_t width = utf8DisplayWidth(line);
+    if (width == 0) return 1;
+    return static_cast<int>((width + static_cast<size_t>(columns) - 1) /
+                            static_cast<size_t>(columns));
+}
+
+// 把文本补齐/截断到指定显示宽度，左侧留 leftPad 个空格
+std::string fillTo(const std::string& text, int width, int leftPad) {
+    std::string out = text;
+    int current = static_cast<int>(textDisplayWidth(out));
+    if (current + leftPad > width) {
+        const int keep = width - leftPad > 0 ? width - leftPad : 0;
+        out = truncateToWidth(out, static_cast<size_t>(keep));
+        current = static_cast<int>(textDisplayWidth(out));
+    }
+    const int tail = width - current - leftPad;
+    return std::string(static_cast<size_t>(leftPad), ' ') + out +
+           std::string(static_cast<size_t>(tail > 0 ? tail : 0), ' ');
+}
+
+// █ 实心条：选中项整行铺满，像参考界面那样"跳出来"
+// 内宽固定 width-4，两侧各留 "█ " 与 " █"，保证与普通行等宽
+std::string solidBar(int width, const std::string& inner) {
+    return "█ " + fillTo(inner, width - 4, 0) + " █";
+}
+
+// 普通行：左侧竖线 + 内容（同样 width 列宽）
+std::string plainRow(int width, const std::string& inner) {
+    return "  │ " + fillTo(inner, width - 4, 0);
+}
+
+std::string rule(const std::string& left, const std::string& right, int width) {
+    std::string line = left;
+    for (int i = 0; i < width - 2; ++i) line += "─";
+    line += right;
+    return line;
+}
+
+// 框线风格的区块标题：  ▍主菜单
+void printBoxSection(const std::string& title) {
+    std::cout << "  " << paint("▍", Color::Cyan) << paint(title, Color::Bold) << "\n";
+}
+
+}  // namespace
+
+void printAppHeader(const std::string& subtitle) {
+    const int width = boxWidth();
+    const std::string title = "◈ " + subtitle + "   v" + std::string(versionString());
+    std::cout << paint(rule("╭", "╮", width), Color::Cyan) << "\n";
+    std::cout << paint("│", Color::Cyan) << fillTo(title, width - 2, 2) << paint("│", Color::Cyan)
+              << "\n";
+    std::cout << paint(rule("╰", "╯", width), Color::Cyan) << "\n";
+}
+
+void beginFunctionScreen(const std::string& title) {
+    // 只有真实终端才清屏：输出被重定向时（脚本/CI）保持纯粹的追加输出
+    if (stdoutIsTerminal()) clearScreen();
+    printAppHeader(title);
+}
+void printStatusRow(const std::string& label, const std::string& value) {
+    std::string padded = label;
+    const int current = static_cast<int>(textDisplayWidth(padded));
+    for (int i = current; i < 10; ++i) padded += ' ';
+    // 这里的值常常是完整路径，很容易超过控制台宽度而折行 —— 必须截断，
+    // 否则后续"上移重绘"的算术会错位。
+    printBoxLine("  " + paint(padded, Color::Gray) + value);
+}
+
+std::string checkMark(bool on) { return on ? "[■]" : "[ ]"; }
+std::string radioMark(bool on) { return on ? "(●)" : "(○)"; }
+
+void printPanel(const std::string& title, const std::vector<std::string>& lines) {
+    const int width = boxWidth();
+    auto rule = [width](const char* left, const char* right) {
+        std::string text = left;
+        for (int i = 0; i < width - 2; ++i) text += "─";
+        text += right;
+        return text;
+    };
+    std::cout << paint(rule("╭", "╮"), Color::Cyan) << "\n";
+    if (!title.empty()) {
+        std::cout << paint("│", Color::Cyan) << fillTo(" " + title, width - 2, 0)
+                  << paint("│", Color::Cyan) << "\n";
+        std::cout << paint("├", Color::Cyan);
+        for (int i = 0; i < width - 2; ++i) std::cout << paint("─", Color::Gray);
+        std::cout << paint("┤", Color::Cyan) << "\n";
+    }
+    for (const std::string& line : lines) {
+        // 内容补齐到内宽，右侧竖线才能对齐（中文按 2 列计）
+        std::string content = line;
+        if (static_cast<int>(textDisplayWidth(content)) > width - 4) {
+            content = truncateToWidth(content, static_cast<size_t>(width - 4));
+        }
+        const int pad = width - 4 - static_cast<int>(textDisplayWidth(content));
+        content += std::string(static_cast<size_t>(pad > 0 ? pad : 0), ' ');
+        std::cout << paint("│", Color::Cyan) << " " << content << " " << paint("│", Color::Cyan)
+                  << "\n";
+    }
+    std::cout << paint(rule("╰", "╯"), Color::Cyan) << "\n";
+}
+
+// 复选列表：↑↓ 移动、空格/数字键切换、A 全选、N 全不选、ENTER 确认、Esc 取消
+bool runCheckList(const std::string& title, const std::vector<std::string>& labels,
+                  std::vector<bool>& checked, const std::string& hint) {
+    if (labels.empty()) return false;
+    checked.resize(labels.size(), false);
+    if (!clickableAvailable()) {
+        // 非交互式：退回"输入编号列表"的老办法
+        if (!title.empty()) printSectionTitle(title);
+        for (size_t i = 0; i < labels.size(); ++i) {
+            std::cout << "  " << (i + 1) << ") " << checkMark(checked[i]) << " " << labels[i] << "\n";
+        }
+        std::string line;
+        if (!readLineUtf8("输入要启用的编号（逗号分隔，all = 全部）: ", line)) return false;
+        if (line.empty()) return false;
+        std::string lower = line;
+        for (char& c : lower) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+        if (lower.find("all") != std::string::npos) {
+            for (size_t i = 0; i < checked.size(); ++i) checked[i] = true;
+            return true;
+        }
+        for (size_t i = 0; i < checked.size(); ++i) checked[i] = false;
+        std::string token;
+        for (size_t i = 0; i <= line.size(); ++i) {
+            if (i == line.size() || line[i] == ',' || line[i] == ' ') {
+                if (!token.empty()) {
+                    const int index = std::atoi(token.c_str());
+                    if (index >= 1 && index <= static_cast<int>(checked.size())) {
+                        checked[static_cast<size_t>(index - 1)] = true;
+                    }
+                    token.clear();
+                }
+            } else {
+                token.push_back(line[i]);
+            }
+        }
+        return true;
+    }
+
+    int cursor = 0;
+    int drawn = 0;
+    if (!title.empty()) printSectionTitle(title);
+    for (;;) {
+        if (drawn > 0) std::cout << "\x1b[" << drawn << "A\x1b[0J";
+        clickableClear();
+        drawn = 0;
+        const int width = boxWidth();
+        for (size_t i = 0; i < labels.size(); ++i) {
+            const std::string box = checkMark(checked[i]) + " " + labels[i];
+            if (static_cast<int>(i) == cursor) {
+                drawn += printBoxLine(paint(solidBar(width, "▶ " + box), Color::Cyan));
+                clickableAddRow(clickableRow() - 1, static_cast<int>(i) + 1,
+                                "▶ " + checkMark(checked[i]) + " " + labels[i]);
+            } else {
+                drawn += printBoxLine("  │ " + fillTo(" " + box, width - 4, 0));
+                clickableAddRow(clickableRow() - 1, static_cast<int>(i) + 1,
+                                "  │ " + checkMark(checked[i]) + " " + labels[i]);
+            }
+        }
+        drawn += printBoxLine(paint(
+            "  ╰" + std::string(static_cast<size_t>(width > 4 ? width - 3 : 1), '-'), Color::Gray));
+        std::string help = "  ↑ ↓ 移动    空格/数字 勾选    A 全选    N 全不选    ENTER 确认    Esc 取消";
+        if (!hint.empty()) help += "    " + hint;
+        drawn += printBoxLine(paint(help, Color::Gray));
+        std::cout << std::flush;
+
+        const ConsoleEvent event = pollConsoleEvent();
+        if (event.kind == ConsoleEventKind::Key) {
+            const int count = static_cast<int>(labels.size());
+            if (event.virtualKey == ConsoleVkUp) {
+                cursor = (cursor + count - 1) % count;
+            } else if (event.virtualKey == ConsoleVkDown) {
+                cursor = (cursor + 1) % count;
+            } else if (event.key == ' ') {
+                checked[static_cast<size_t>(cursor)] = !checked[static_cast<size_t>(cursor)];
+            } else if (event.key == 'a' || event.key == 'A') {
+                for (size_t i = 0; i < checked.size(); ++i) checked[i] = true;
+            } else if (event.key == 'n' || event.key == 'N') {
+                for (size_t i = 0; i < checked.size(); ++i) checked[i] = false;
+            } else if (event.key == '\r' || event.key == '\n') {
+                std::cout << "\n";
+                return true;
+            } else if (event.key == 27) {
+                std::cout << "\n";
+                return false;
+            } else if (event.key >= '1' && event.key <= '9') {
+                const size_t index = static_cast<size_t>(event.key - '1');
+                if (index < checked.size()) {
+                    cursor = static_cast<int>(index);
+                    checked[index] = !checked[index];
+                }
+            }
+            continue;
+        }
+        if (event.kind == ConsoleEventKind::MouseClick) {
+            const int hit = lookupClick(event.row, event.column);
+            if (hit != kNoClickValue) {
+                const size_t index = static_cast<size_t>(hit - 1);
+                if (index < checked.size()) {
+                    cursor = static_cast<int>(index);
+                    checked[index] = !checked[index];
+                }
+            }
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+}
+
+// 按钮式二选一：╔═ 是 ═╗  ┌─ 否 ─┐
+bool askButtonYesNo(const std::string& question, bool defaultValue) {
+    if (!clickableAvailable()) return askYesNo(question + " (y/N): ", defaultValue);
+
+    std::cout << "\n  " << paint(question, Color::Bold) << "\n";
+    int selected = defaultValue ? 0 : 1;
+    int drawn = 0;
+    for (;;) {
+        if (drawn > 0) std::cout << "\x1b[" << drawn << "A\x1b[0J";
+        clickableClear();
+        drawn = 0;
+        const int row = clickableRow();
+        const int startColumn = clickableColumn();
+        const std::string yes = selected == 0 ? "╔═ 是 (Y) ═╗" : "┌─ 是 (Y) ─┐";
+        const std::string no = selected == 1 ? "╔═ 否 (N) ═╗" : "┌─ 否 (N) ─┐";
+        std::string line = "  ";
+        const int yesBegin = static_cast<int>(textDisplayWidth(line));
+        line += (selected == 0) ? paint(yes, Color::Cyan) : yes;
+        const int yesEnd = static_cast<int>(textDisplayWidth(line)) - 1;
+        line += "   ";
+        const int noBegin = static_cast<int>(textDisplayWidth(line));
+        line += (selected == 1) ? paint(no, Color::Cyan) : no;
+        const int noEnd = static_cast<int>(textDisplayWidth(line)) - 1;
+        drawn += printBoxLine(line);
+        clickableAddSpan(row, startColumn + yesBegin, startColumn + yesEnd, 1, "是 (Y)");
+        clickableAddSpan(row, startColumn + noBegin, startColumn + noEnd, 0, "否 (N)");
+        drawn += printBoxLine(paint("  ← → 选择    ENTER 确认    Y / N 直选", Color::Gray));
+        std::cout << std::flush;
+
+        const ConsoleEvent event = pollConsoleEvent();
+        if (event.kind == ConsoleEventKind::Key) {
+            if (event.virtualKey == ConsoleVkLeft || event.virtualKey == ConsoleVkRight) {
+                selected = 1 - selected;
+            } else if (event.key == '\r' || event.key == '\n') {
+                std::cout << "\n";
+                return selected == 0;
+            } else if (event.key == 'y' || event.key == 'Y') {
+                std::cout << "\n";
+                return true;
+            } else if (event.key == 'n' || event.key == 'N' || event.key == 27) {
+                std::cout << "\n";
+                return false;
+            }
+            continue;
+        }
+        if (event.kind == ConsoleEventKind::MouseClick) {
+            const int hit = lookupClick(event.row, event.column);
+            if (hit == 0 || hit == 1) {
+                if ((hit == 0 && selected == 1) || (hit == 1 && selected == 0)) {
+                    std::cout << "\n";
+                    return hit == 1;
+                }
+                selected = hit == 1 ? 0 : 1;
+            }
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+}
+
+int runBoxMenu(const std::string& title, const std::vector<BoxMenuItem>& items, int defaultValue) {
+    if (items.empty()) return defaultValue;
+
+    int low = items.front().value;
+    int high = items.front().value;
+    for (const BoxMenuItem& item : items) {
+        low = std::min(low, item.value);
+        high = std::max(high, item.value);
+    }
+
+    // 非交互式（管道/文件输入）：退回"编号列表 + 读一行"，脚本与 CI 行为完全不变
+    if (!clickableAvailable()) {
+        if (!title.empty()) printSectionTitle(title);
+        for (const BoxMenuItem& item : items) {
+            std::cout << "  " << item.value << ") " << item.label;
+            if (!item.hint.empty()) std::cout << "        （" << item.hint << "）";
+            std::cout << "\n";
+        }
+        return askMenuChoice(
+            "请选择 [" + std::to_string(low) + "-" + std::to_string(high) + "]: ", low, high,
+            defaultValue);
+    }
+
+    const int width = boxWidth();
+    int selected = 0;
+    for (size_t i = 0; i < items.size(); ++i) {
+        if (items[i].value == defaultValue) selected = static_cast<int>(i);
+    }
+    std::string typedDigits;
+    int drawnLines = 0;
+
+    if (!title.empty()) printBoxSection(title);
+
+    for (;;) {
+        if (drawnLines > 0) std::cout << "\x1b[" << drawnLines << "A\x1b[0J";
+        clickableClear();
+        drawnLines = 0;
+
+        for (size_t i = 0; i < items.size(); ++i) {
+            const BoxMenuItem& item = items[i];
+            const std::string label = "[" + std::to_string(item.value) + "] " + item.label;
+            // 内容统一按 width-4 排版，保证 █ 行与 │ 行左右对齐
+            // 每行恒占 width 列（4 列前缀 + width-4 内容），两端都不越界：
+            // 越界会折行，而折行会让"上移 N 行重绘"的算术错位 —— 菜单就会一轮轮重复打印。
+            const std::string titleText = " " + label;
+            const int titleWidth = static_cast<int>(textDisplayWidth(titleText));
+            int hintSpace = width - 4 - titleWidth - 1;   // 右侧说明可用的列数（再留 1 列）
+            std::string hintText;
+            if (!item.hint.empty() && hintSpace >= 6) {
+                hintText = item.hint;
+                if (static_cast<int>(textDisplayWidth(hintText)) > hintSpace) {
+                    hintText = truncateToWidth(hintText, static_cast<size_t>(hintSpace - 1)) + "…";
+                }
+            }
+            const int hintWidth =
+                hintText.empty() ? 0 : static_cast<int>(textDisplayWidth(hintText));
+            const std::string content = fillTo(titleText, width - 4 - hintWidth, 0);
+            if (static_cast<int>(i) == selected) {
+                const std::string first = solidBar(width, "▶" + label);
+                drawnLines += printBoxLine(paint(first, Color::Cyan));
+                clickableAddRow(clickableRow() - 1, item.value, "▶" + label);
+                const std::string hint = item.hint.empty() ? std::string("ENTER 执行") : item.hint;
+                drawnLines += printBoxLine(paint(solidBar(width, "   " + hint), Color::Cyan));
+                clickableAddRow(clickableRow() - 1, item.value, "   " + hint);
+            } else {
+                const std::string row =
+                    "  │ " + content + (hintText.empty() ? std::string() : paint(hintText, Color::Gray));
+                drawnLines += printBoxLine(row);
+                clickableAddRow(clickableRow() - 1, item.value, "  │ " + label);
+            }
+        }
+        drawnLines += printBoxLine(paint(
+            "  ╰" + std::string(static_cast<size_t>(width > 4 ? width - 3 : 1), '-'), Color::Gray));
+        drawnLines += printBoxLine(paint(
+            "  ↑ ↓ 选择    ENTER 执行    数字键直选    Esc/Q 返回    鼠标可点", Color::Gray));
+        std::cout << std::flush;
+
+        const ConsoleEvent event = pollConsoleEvent();
+        if (event.kind == ConsoleEventKind::Key) {
+            const int key = event.key;
+            const int vk = event.virtualKey;
+            const int count = static_cast<int>(items.size());
+            if (vk == ConsoleVkUp) {
+                selected = (selected + count - 1) % count;
+            } else if (vk == ConsoleVkDown) {
+                selected = (selected + 1) % count;
+            } else if (vk == ConsoleVkHome) {
+                selected = 0;
+            } else if (vk == ConsoleVkEnd) {
+                selected = count - 1;
+            } else if (key == '\r' || key == '\n') {
+                if (!typedDigits.empty()) {
+                    const int wanted = std::atoi(typedDigits.c_str());
+                    typedDigits.clear();
+                    for (const BoxMenuItem& item : items) {
+                        if (item.value == wanted) {
+                            std::cout << "\n";
+                            return item.value;
+                        }
+                    }
+                    continue;
+                }
+                std::cout << "\n";
+                return items[static_cast<size_t>(selected)].value;
+            } else if (key == 27 || key == 'q' || key == 'Q') {
+                std::cout << "\n";
+                return defaultValue;
+            } else if (key >= '0' && key <= '9') {
+                typedDigits.push_back(static_cast<char>(key));
+                const int wanted = std::atoi(typedDigits.c_str());
+                for (size_t i = 0; i < items.size(); ++i) {
+                    if (items[i].value == wanted) selected = static_cast<int>(i);
+                }
+            }
+            continue;
+        }
+        if (event.kind == ConsoleEventKind::MouseClick) {
+            const int hit = lookupClick(event.row, event.column);
+            if (hit != kNoClickValue) {
+                if (hit == items[static_cast<size_t>(selected)].value) {
+                    std::cout << "\n";
+                    return hit;   // 再点一次当前高亮项 = 确认
+                }
+                for (size_t i = 0; i < items.size(); ++i) {
+                    if (items[i].value == hit) selected = static_cast<int>(i);
+                }
+            }
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    }
+}
+
+int askBoxOptions(const std::string& title, const std::vector<std::pair<int, std::string>>& options,
+                  int defaultValue) {
+    if (options.empty()) return defaultValue;
+    if (!clickableAvailable()) return askOptionRow(title, options, defaultValue);
+
+    int selected = 0;
+    for (size_t i = 0; i < options.size(); ++i) {
+        if (options[i].first == defaultValue) selected = static_cast<int>(i);
+    }
+    int drawnLines = 0;
+    std::cout << "\n  " << paint(title, Color::Bold) << "\n";
+    for (;;) {
+        if (drawnLines > 0) std::cout << "\x1b[" << drawnLines << "A\x1b[0J";
+        clickableClear();
+        drawnLines = 0;
+
+        const int row = clickableRow();
+        const int startColumn = clickableColumn();
+        std::string line = "  ";
+        std::vector<std::pair<int, int>> spans;
+        for (size_t i = 0; i < options.size(); ++i) {
+            const std::string text = std::to_string(options[i].first) + ") " + options[i].second;
+            const int begin = static_cast<int>(textDisplayWidth(line));
+            const std::string box = (static_cast<int>(i) == selected) ? "╔═ " + text + " ═╗"
+                                                                     : "┌─ " + text + " ─┐";
+            line += (static_cast<int>(i) == selected) ? paint(box, Color::Cyan) : box;
+            spans.emplace_back(begin, begin + static_cast<int>(textDisplayWidth(box)) - 1);
+            line += "  ";
+        }
+        drawnLines += printBoxLine(line);
+        for (size_t i = 0; i < options.size(); ++i) {
+            clickableAddSpan(row, startColumn + spans[i].first, startColumn + spans[i].second,
+                             options[i].first,
+                             std::to_string(options[i].first) + ") " + options[i].second);
+        }
+        drawnLines += printBoxLine(paint("  ← → 选择    ENTER 确认", Color::Gray));
+        std::cout << std::flush;
+
+        const ConsoleEvent event = pollConsoleEvent();
+        if (event.kind == ConsoleEventKind::Key) {
+            const int count = static_cast<int>(options.size());
+            if (event.virtualKey == ConsoleVkLeft) {
+                selected = (selected + count - 1) % count;
+            } else if (event.virtualKey == ConsoleVkRight) {
+                selected = (selected + 1) % count;
+            } else if (event.key == '\r' || event.key == '\n') {
+                std::cout << "\n";
+                return options[static_cast<size_t>(selected)].first;
+            } else if (event.key == 27 || event.key == 'q' || event.key == 'Q') {
+                std::cout << "\n";
+                return defaultValue;
+            } else if (event.key >= '1' && event.key <= '9') {
+                for (size_t i = 0; i < options.size(); ++i) {
+                    if (options[i].first == event.key - '0') selected = static_cast<int>(i);
+                }
+            }
+            continue;
+        }
+        if (event.kind == ConsoleEventKind::MouseClick) {
+            const int hit = lookupClick(event.row, event.column);
+            if (hit != kNoClickValue) {
+                if (hit == options[static_cast<size_t>(selected)].first) {
+                    std::cout << "\n";
+                    return hit;
+                }
+                for (size_t i = 0; i < options.size(); ++i) {
+                    if (options[i].first == hit) selected = static_cast<int>(i);
+                }
+            }
+            continue;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(25));
     }
@@ -1050,45 +1560,65 @@ std::string describeSettings(const Config& cfg) {
 
 void settingsMenu(Config& cfg) {
     for (;;) {
-        printSectionTitle("设置");
-        clickableClear();
-        std::cout << "  " << paint("配置文件: ", Color::Gray) << wideToUtf8(configFilePath())
-                  << (configFileExists() ? paint(configFileIsHidden() ? "  [已隐藏]" : "  [未隐藏]",
-                                                 Color::Gray)
-                                         : paint("  [尚未创建]", Color::Yellow))
-                  << "\n";
-        // 设置项也做成可点击的
-        {
-            const std::vector<std::pair<int, std::string>> items = {
-                {1, std::string("  1) 哈希算法           当前: ") + algoDisplayList(cfg.algos)},
-                {2, std::string("  2) 线程数             当前: ") +
-                        (cfg.threads > 0 ? std::to_string(cfg.threads)
-                                         : std::to_string(effectiveThreadCount(0)) + " (自动)")},
-                {3, std::string("  3) 读取缓冲区 (MB)    当前: ") + std::to_string(cfg.bufferMB)},
-                {4, std::string("  4) 默认输出格式       当前: ") + formatDisplay(cfg.format)},
-                {5, std::string("  5) 进度条             ") + (cfg.progress ? "开" : "关")},
-                {6, std::string("  6) ASCII 进度条       ") + (cfg.asciiBar ? "开" : "关")},
-                {7, std::string("  7) 读取/计算流水线    ") + (cfg.overlap ? "开" : "关")},
-                {8, std::string("  8) 递归子目录         ") + (cfg.recursive ? "开" : "关")},
-                {9, std::string("  9) 文件过滤          当前: ") +
-                        (cfg.filters.empty() ? std::string("(无)") : wideToUtf8(cfg.filters))},
-                {10, std::string(" 10) 校验时检查文件大小 ") + (cfg.verifyCheckSize ? "开" : "关")},
-                {11, std::string(" 11) 输出文件加 UTF-8 BOM ") + (cfg.bom ? "开" : "关")},
-                {12, std::string(" 12) 彩色输出           ") + (cfg.colors ? "开" : "关")},
-                {0, "  0) 返回（自动保存设置）"},
-            };
-            for (const auto& item : items) {
-                const int row = clickableRow();
-                std::cout << item.second << "\n";
-                clickableAddRow(row, item.first, item.second);
-            }
-        }
-        printClickHint();
+        printBoxSection("设置");
+        printStatusRow("配置文件", wideToUtf8(configFilePath()) +
+                                       (configFileExists()
+                                            ? (configFileIsHidden() ? "  [已隐藏]" : "  [未隐藏]")
+                                            : "  [尚未创建]"));
+        std::cout << "\n";
 
-        const int choice = askMenuChoice("请选择 [0-12]: ", 0, 12, 0);
+        // 复选框风格：开关项 [■]/[ ]，取值项 [≡]，动作项 [↵]
+        const std::vector<BoxMenuItem> items = {
+            {1, "[≡] 哈希算法", algoDisplayList(cfg.algos), true},
+            {2, "[≡] 线程数", cfg.threads > 0 ? std::to_string(cfg.threads)
+                                             : std::to_string(effectiveThreadCount(0)) + " (自动)"},
+            {3, "[≡] 读取缓冲区 (MB)", std::to_string(cfg.bufferMB)},
+            {4, "[≡] 默认输出格式", formatDisplay(cfg.format)},
+            {5, std::string(checkMark(cfg.progress)) + " 进度条", cfg.progress ? "开" : "关"},
+            {6, std::string(checkMark(cfg.asciiBar)) + " ASCII 进度条", cfg.asciiBar ? "开" : "关"},
+            {7, std::string(checkMark(cfg.overlap)) + " 读取/计算流水线", cfg.overlap ? "开" : "关"},
+            {8, std::string(checkMark(cfg.recursive)) + " 递归子目录", cfg.recursive ? "开" : "关"},
+            {9, "[≡] 文件过滤", cfg.filters.empty() ? "(无)" : wideToUtf8(cfg.filters)},
+            {10, std::string(checkMark(cfg.verifyCheckSize)) + " 校验时检查文件大小",
+             cfg.verifyCheckSize ? "开" : "关"},
+            {11, std::string(checkMark(cfg.bom)) + " 输出文件加 UTF-8 BOM", cfg.bom ? "开" : "关"},
+            {12, std::string(checkMark(cfg.colors)) + " 彩色输出", cfg.colors ? "开" : "关"},
+            {0, "[↵] 返回（自动保存设置）", ""},
+        };
+        const int choice = runBoxMenu(std::string(), items, 0);   // 标题已在上面打印，避免重复
         if (choice == 0) break;
         switch (choice) {
             case 1: {
+                if (clickableAvailable()) {
+                    // 复选框列表：空格勾选、A 全选、N 全不选、ENTER 确认
+                    const std::vector<Algo> all = allAlgos();
+                    std::vector<std::string> labels;
+                    std::vector<bool> checked;
+                    for (Algo algo : all) {
+                        const AlgoInfo& info = algoInfo(algo);
+                        labels.push_back(std::string(info.display) + "  (" + info.id + ")" +
+                                         (info.secure ? "   ✔ 推荐" : "   ⚠ 仅完整性检查"));
+                        bool on = false;
+                        for (Algo selected : cfg.algos) {
+                            if (selected == algo) on = true;
+                        }
+                        checked.push_back(on);
+                    }
+                    if (runCheckList("选择哈希算法（可多选）", labels, checked,
+                                     "勾选后会一次读取算出全部摘要")) {
+                        std::vector<Algo> picked;
+                        for (size_t i = 0; i < all.size(); ++i) {
+                            if (checked[i]) picked.push_back(all[i]);
+                        }
+                        if (picked.empty()) {
+                            printWarning("至少要选一种算法，保持原设置");
+                        } else {
+                            cfg.algos = picked;
+                            printSuccess("算法已更新：" + algoDisplayList(cfg.algos));
+                        }
+                    }
+                    break;
+                }
                 std::cout << "可用算法: " << algoIdList(allAlgos()) << "\n";
                 std::cout << "（可多选，用逗号分隔；all 表示全部）\n";
                 std::string line;
@@ -1111,7 +1641,7 @@ void settingsMenu(Config& cfg) {
                                                           static_cast<int>(cfg.bufferMB)));
                 break;
             case 4: {
-                const int format = askOptionRow("输出格式", {{1, "文本"}, {2, "CSV"}, {3, "JSON"}},
+                const int format = askBoxOptions("输出格式", {{1, "文本"}, {2, "CSV"}, {3, "JSON"}},
                                                     static_cast<int>(cfg.format));
                 cfg.format = format == 2 ? OutFormat::Csv : (format == 3 ? OutFormat::Json : OutFormat::Text);
                 break;
@@ -1149,34 +1679,32 @@ int runInteractiveMenu(Config& cfg) {
     }
     for (;;) {
         clearScreen();
-        showBanner();
-        std::cout << "\n  " << paint("当前设置: ", Color::Gray) << describeSettings(cfg) << "\n";
+        printAppHeader("EHsc · 纯 C++ 文件哈希与校验工具");
+        std::cout << "\n";
+        printStatusRow("算法", describeSettings(cfg));
+        printStatusRow("配置", wideToUtf8(configFilePath()) +
+                                  (configFileExists()
+                                       ? (configFileIsHidden() ? "  [已隐藏]" : "  [未隐藏]")
+                                       : "  [尚未创建]"));
+        printStatusRow("状态", paint("● 就绪", Color::Green));
+        std::cout << "\n";
 
-        printSectionTitle("主菜单");
-        clickableClear();
-        // 每个条目登记为一个可点击区域（鼠标支持时可直接点击选择）
-        struct MenuItem { int value; const char* text; };
-        static const MenuItem kMainMenu[] = {
-            {1, "  1) 计算文件哈希          （可多选文件，Windows 原生选择器）"},
-            {2, "  2) 计算文件夹哈希        （递归 / 按通配符过滤）"},
-            {3, "  3) 生成校验清单文件      （TXT / CSV / JSON）"},
-            {4, "  4) 校验清单文件          （检测篡改 / 缺失 / 大小变化）"},
-            {5, "  5) 字节级文件比较        （定位第一个不同字节）"},
-            {6, "  6) 算法速度对比          （同一数据下各算法吞吐量）"},
-            {7, "  7) 运行内置自检          （标准测试向量验证实现）"},
-            {8, "  8) 文件访问监听          （监听期间谁读取/写入了所选文件）"},
-            {9, "  9) 设置                  （算法 / 线程 / 缓冲区 / 输出格式）"},
-            {10, " 10) 查看支持的算法说明"},
-            {0, "  0) 退出"},
+        // 主菜单：█ 高亮当前项；↑↓ 选择、ENTER 执行、数字键直选、鼠标可点
+        static const std::vector<BoxMenuItem> kMainMenu = {
+            {1, "计算文件哈希", "可多选文件 · Windows 原生选择器"},
+            {2, "计算文件夹哈希", "递归 / 按通配符过滤"},
+            {3, "生成校验清单文件", "TXT / CSV / JSON"},
+            {4, "校验清单文件", "检测篡改 / 缺失 / 大小变化"},
+            {5, "字节级文件比较", "定位第一个不同字节"},
+            {6, "算法速度对比", "同一数据下各算法吞吐量"},
+            {7, "运行内置自检", "标准测试向量验证实现"},
+            {8, "文件访问监听", "谁读写了它 · 它被干了什么（建议管理员）"},
+            {9, "设置", "算法 / 线程 / 缓冲区 / 输出格式"},
+            {10, "查看支持的算法说明", ""},
+            {11, "文件活动审计", "只关心它被干了什么（不需管理员）"},
+            {0, "退出", ""},
         };
-        for (const MenuItem& item : kMainMenu) {
-            const int row = clickableRow();
-            std::cout << item.text << "\n";
-            clickableAddRow(row, item.value, item.text);
-        }
-        printClickHint();
-
-        const int choice = askMenuChoice("\n请选择 [0-10]: ", 0, 10, -1);
+        const int choice = runBoxMenu("主菜单", kMainMenu, -1);
         if (choice <= 0) {
             saveConfig(cfg);
             std::cout << "\n" << paint("感谢使用 EHsc，再见！", Color::Cyan) << "\n\n";
@@ -1185,7 +1713,7 @@ int runInteractiveMenu(Config& cfg) {
 
         switch (choice) {
             case 1: {
-                printSectionTitle("计算文件哈希");
+                beginFunctionScreen("计算文件哈希");
                 std::cout << "提示：直接回车将打开 Windows 文件选择器（可多选）\n";
                 const std::vector<std::wstring> targets =
                     askTargets("请输入文件路径（多个用 ; 分隔）: ", true, false);
@@ -1197,7 +1725,7 @@ int runInteractiveMenu(Config& cfg) {
                 break;
             }
             case 2: {
-                printSectionTitle("计算文件夹哈希");
+                beginFunctionScreen("计算文件夹哈希");
                 std::cout << "提示：直接回车将打开 Windows 文件夹选择器\n";
                 const std::vector<std::wstring> targets =
                     askTargets("请输入文件夹路径: ", false, true);
@@ -1236,7 +1764,7 @@ int runInteractiveMenu(Config& cfg) {
                 break;
             }
             case 4: {
-                printSectionTitle("校验清单文件");
+                beginFunctionScreen("校验清单文件");
                 std::wstring manifest;
                 std::string line;
                 if (readLineUtf8("请输入清单文件路径（回车打开选择器）: ", line) && !line.empty()) {
@@ -1258,7 +1786,7 @@ int runInteractiveMenu(Config& cfg) {
                 break;
             }
             case 5: {
-                printSectionTitle("字节级文件比较");
+                beginFunctionScreen("字节级文件比较");
                 // 先问路径：直接回车才打开原生选择器，选择器里选中的文件会被保留，
                 // 不会像以前那样"先弹选择器、选完还要再手打一遍路径"。
                 std::cout << "提示：可一次输入两个路径（用 ; 分隔）；直接回车打开文件选择器（可多选）\n";
@@ -1283,7 +1811,7 @@ int runInteractiveMenu(Config& cfg) {
                 break;
             }
             case 6: {
-                printSectionTitle("算法速度对比");
+                beginFunctionScreen("算法速度对比");
                 const std::vector<std::wstring> targets =
                     askTargets("请输入用于测试的文件（回车调用选择器）: ", false, false);
                 if (targets.empty()) {
@@ -1300,7 +1828,7 @@ int runInteractiveMenu(Config& cfg) {
                 break;
             }
             case 8: {
-                printSectionTitle("文件访问监听");
+                beginFunctionScreen("文件访问监听 · 谁读写了它 · 它被干了什么");
                 std::cout << "监听期间，记录所选文件/文件夹被哪个进程读取或写入。\n";
                 std::cout << "提示：想知道是哪个进程，建议以管理员身份运行本程序；\n";
                 std::cout << "      非管理员只能归因当前用户可访问的进程（仍可看到文件变更时间线）。\n";
@@ -1317,8 +1845,8 @@ int runInteractiveMenu(Config& cfg) {
                 watch.recursive = cfg.recursive;
                 watch.filters = parseFilters(cfg.filters);
                 watch.interactivePrompt = true;   // 菜单流程：照常询问是否提权
-                if (askYesNo("是否把监听报告保存成文件? (y/N): ", false)) {
-                    const int format = askOptionRow("报告格式", {{1, "文本"}, {2, "CSV"}, {3, "JSON"}}, 1);
+                if (askButtonYesNo("是否把监听报告保存成文件？", false)) {
+                    const int format = askBoxOptions("报告格式", {{1, "文本"}, {2, "CSV"}, {3, "JSON"}}, 1);
                     watch.format = format == 2 ? OutFormat::Csv
                                                : (format == 3 ? OutFormat::Json : OutFormat::Text);
                     std::string line;
@@ -1338,11 +1866,55 @@ int runInteractiveMenu(Config& cfg) {
                 break;
             }
             case 9:
+                if (stdoutIsTerminal()) clearScreen();
                 settingsMenu(cfg);
                 break;
             case 10:
+                if (stdoutIsTerminal()) clearScreen();
                 cmdListAlgos();
                 break;
+            case 11: {
+                beginFunctionScreen("文件活动审计 · 它被干了什么");
+                // 文件活动审计：只回答"这个文件/目录被干了什么"，
+                // 不做句柄归因（因此不需要管理员权限，也不会弹 UAC 询问）。
+                std::cout << "监听期间记录目标被干了什么：新建 / 写入 / 截断 / 原地改写 / 改名 /\n";
+                std::cout << "删除 / 属性变化 / 时间戳变化，并给出大小与内容摘要的前后对比。\n";
+                std::cout << "提示：直接回车将打开 Windows 文件/文件夹选择器\n";
+                const std::vector<std::wstring> targets =
+                    askTargets("请输入要审计的文件或文件夹: ", true, false);
+                if (targets.empty()) {
+                    printWarning("未选择任何目标");
+                    break;
+                }
+                const int seconds =
+                    askInt("监听时长（秒，0 = 直到按 Q 停止）[默认 30]: ", 0, 86400, 30);
+                WatchRunOptions watch;
+                watch.seconds = static_cast<double>(seconds);
+                watch.recursive = cfg.recursive;
+                watch.filters = parseFilters(cfg.filters);
+                watch.pollHandles = false;    // 纯活动审计：不需要句柄归因
+                watch.trackActivity = true;
+                watch.digestContent = true;
+                watch.elevate = ElevateMode::Never;   // 也就不需要提权
+                if (askButtonYesNo("是否把审计报告保存成文件？", false)) {
+                    const int format =
+                        askBoxOptions("报告格式", {{1, "文本"}, {2, "CSV"}, {3, "JSON"}}, 1);
+                    watch.format = format == 2 ? OutFormat::Csv
+                                               : (format == 3 ? OutFormat::Json : OutFormat::Text);
+                    std::string line;
+                    if (readLineUtf8("报告保存路径（回车打开保存对话框）: ", line) && !line.empty()) {
+                        watch.output = stripQuotes(utf8ToWide(line));
+                    } else {
+                        const std::wstring defaultName =
+                            std::wstring(L"ehsc-activity.") + utf8ToWide(formatName(watch.format));
+                        watch.output = pickSaveFile(L"保存活动审计报告", defaultName, L"报告文件",
+                                                    watch.format == OutFormat::Csv ? L"*.csv"
+                                                                                   : L"*.txt");
+                    }
+                }
+                cmdWatch(cfg, targets, watch);
+                break;
+            }
             default: break;
         }
         pauseForEnter();

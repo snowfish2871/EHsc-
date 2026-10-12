@@ -74,6 +74,52 @@ struct ChangeRecord {
     uint64_t     bytes = 0;        // 写入事件里能拿到的字节数（多数情况为 0）
 };
 
+// ---------------------------------------------------------- 文件活动记录 --
+// "这个文件到底被干了什么"：每次变化都拍一次快照并和上一次对比，
+// 把差异（大小 / 修改时间 / 属性 / 内容摘要）写成一条可读的活动记录。
+enum class ActivityKind {
+    Created,       // 文件被创建（监听开始时不存在）
+    ContentWritten,// 内容被写入（大小变大或摘要变化）
+    Truncated,     // 内容被截断（大小变小）
+    Rewritten,     // 大小没变但内容变了（原地改写）
+    Deleted,       // 被删除
+    Renamed,       // 被改名
+    AttributesChanged,  // 属性变化（只读/隐藏/系统…）
+    TimestampsChanged,  // 仅时间戳变化（touch 之类）
+    Lost,          // 监听期间失去访问权（被占用/权限变化）
+};
+
+struct FileSnapshot {
+    bool     exists = false;
+    uint64_t size = 0;
+    int64_t  mtime = 0;        // Unix 秒
+    uint32_t attributes = 0;
+    std::string digest;        // 内容摘要（可选，按需计算）
+    bool     digestValid = false;
+};
+
+struct ActivityRecord {
+    int64_t      timeMs = 0;
+    ActivityKind kind = ActivityKind::ContentWritten;
+    std::wstring path;
+    std::wstring newPath;          // Renamed 时的目标路径
+    FileSnapshot before;
+    FileSnapshot after;
+    bool         digestComputed = false;   // 是否算过内容摘要
+    bool         digestChanged = false;    // 摘要是否变化（能证明"内容真的变了"）
+    // 归因：这条活动发生时，正持有该文件句柄的进程（可能为空 —— 瞬间操作抓不到）
+    uint32_t     pid = 0;
+    std::wstring processName;
+    WatchOp      op = WatchOp::MetaOnly;
+    std::string  note;                     // 补充说明（例如"大小未变但内容变了"）
+};
+
+const char* activityKindDisplay(ActivityKind kind);
+const char* activityKindName(ActivityKind kind);
+// 一句话描述这条活动（用于报告与控制台）：
+// 例如"大小 1,024 → 2,048（+1,024）；内容摘要已变化；当时持有者 a.exe (pid 12，写入)"
+std::string describeActivityBrief(const ActivityRecord& record);
+
 struct WatchOptions {
     bool                      recursive = true;
     std::vector<std::wstring> filters;          // 通配符过滤，空 = 全部
@@ -84,11 +130,18 @@ struct WatchOptions {
     bool                      notifyChanges = true;
     bool                      includeSelf = false;   // 是否包含 EHsc 自身产生的事件
     size_t                    maxRecords = 20000;
+    // ---- 活动追踪（"这个文件被干了什么"）----
+    bool                      trackActivity = true;  // 记录活动时间线
+    bool                      digestContent = true;  // 内容变化时算摘要以证明"真的改了"
+    uint64_t                  digestMaxBytes = 64ull << 20;  // 超过这个大小就不算摘要
+    int                       activityIntervalMs = 250;      // 文件目标的快照轮询间隔
 };
 
 struct WatchStats {
     uint64_t     accessRecords = 0;   // 合并后的访问记录条数
     uint64_t     changeEvents = 0;    // 变更事件条数
+    uint64_t     activityRecords = 0; // 活动记录条数（"干了什么"）
+    uint64_t     activitiesWithProcess = 0;  // 其中成功归因到进程的条数
     uint64_t     samples = 0;         // 句柄采样轮次
     uint64_t     processes = 0;       // 涉及的不同进程数
     uint64_t     files = 0;           // 涉及的不同文件数
@@ -103,6 +156,7 @@ struct WatchStats {
 struct WatchResult {
     std::vector<AccessRecord> accesses;
     std::vector<ChangeRecord> changes;
+    std::vector<ActivityRecord> activities;   // 活动时间线：这个文件被干了什么
     WatchStats                stats;
     std::vector<std::wstring> targets;   // 规范化后的目标
     double                    elapsed = 0;
@@ -123,7 +177,8 @@ public:
     bool running() const { return running_.load(); }
 
     // 取出自上次调用以来新增/更新的记录（供界面实时打印）
-    void drain(std::vector<AccessRecord>& newAccesses, std::vector<ChangeRecord>& newChanges);
+    void drain(std::vector<AccessRecord>& newAccesses, std::vector<ChangeRecord>& newChanges,
+               std::vector<ActivityRecord>& newActivities);
 
     // 生成合并后的完整结果（调用前会做一次最终扫描）
     WatchResult snapshot();
@@ -147,6 +202,20 @@ private:
     bool matchesFilter(const std::wstring& lowerPath) const;
     std::wstring resolveProcess(uint32_t pid, std::wstring* fullPath);
 
+    // ---- 活动追踪 ----
+    // 把文件系统给出的"变了"翻译成"干了什么"：拍快照、和上一次对比、写活动记录
+    void activityLoop();                                   // 文件目标：定时轮询快照
+    void trackChanges(const std::vector<ChangeRecord>& source);  // 目录事件 → 活动记录
+    void refreshSnapshot(const std::wstring& path, bool digestHint);
+    // 目录监听时把目录里已有的文件纳入快照对比（通知会漏报"已打开句柄的继续写入"）
+    void collectTrackedFiles(const std::wstring& dir, size_t prefixLength);
+    void pollPath(const std::wstring& path);   // 比对单个文件并产出活动
+    void emitActivity(const std::wstring& path, const FileSnapshot& before, const FileSnapshot& after,
+                      ActivityKind kind, const std::wstring& newPath, int64_t timeMs);
+    bool takeSnapshot(const std::wstring& path, bool withDigest, FileSnapshot& out) const;
+    // 当前正持有该文件句柄的进程（用于把"活动"归因到"谁干的"）
+    bool attributeProcess(const std::wstring& path, uint32_t& pid, std::wstring& name, WatchOp& op);
+
     std::vector<TargetInfo>          targets_;
     std::vector<std::wstring>        normalized_;
     std::vector<std::wstring>        notifyDirs_;      // 需要挂目录变更通知的目录（去重后）
@@ -156,16 +225,25 @@ private:
     std::atomic<bool>                running_{false};
     std::atomic<bool>                stopFlag_{false};
     std::atomic<bool>                scanRequested_{false};   // 变更事件触发立即补一次采样
+    std::atomic<bool>                activityRequested_{false};  // 变更事件立即补一次快照对比
     std::thread                      handleThread_;
+    std::thread                      activityThread_;
     std::vector<std::thread>         notifyThreads_;
     void*                            cancelEvent_ = nullptr;   // HANDLE
 
     std::mutex                       mutex_;
+    std::mutex                       scanMutex_;   // 串行化"整轮句柄扫描+合并"，避免两个线程同时改缓存
     std::unordered_map<std::string, size_t> accessIndex_;     // key -> accesses_ 下标
     std::vector<AccessRecord>        accesses_;
     std::vector<ChangeRecord>        changes_;
+    std::vector<ActivityRecord>      activities_;
     std::vector<AccessRecord>        pendingAccess_;
     std::vector<ChangeRecord>        pendingChange_;
+    std::vector<ActivityRecord>      pendingActivity_;
+    std::unordered_map<std::wstring, FileSnapshot> snapshots_;   // 小写路径 -> 上一次快照
+    std::vector<std::wstring>        trackedPaths_;   // 参与定时比对的文件（文件目标 + 目录内文件）
+    size_t                           pollCursor_ = 0; // 超大目录分批轮询的游标
+    std::vector<ChangeRecord>        pendingChangeForActivity_;  // 待转成活动的原始变更
 
     std::unordered_map<uint32_t, std::wstring> processNameCache_;
     std::unordered_map<uint32_t, std::wstring> processPathCache_;

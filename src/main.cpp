@@ -92,20 +92,24 @@ void printHashResults(const HashJobResult& result, const std::vector<Algo>& algo
 }
 
 void printHashSummary(const HashJobResult& result, const std::vector<Algo>& algos) {
-    printSectionTitle("统计");
-    std::cout << "  文件总数 : " << formatCount(result.records.size()) << "\n";
-    std::cout << "  成功/失败: " << result.okFiles << " / " << result.failedFiles << "\n";
+    std::vector<std::string> lines;
+    lines.push_back("文件总数   " + formatCount(result.records.size()));
+    lines.push_back(std::string("成功/失败  ") + paint(std::to_string(result.okFiles), Color::Green) +
+                    " / " + (result.failedFiles ? paint(std::to_string(result.failedFiles), Color::Red)
+                                                : std::string("0")));
     if (result.cancelledFiles > 0) {
-        std::cout << "  已取消   : " << result.cancelledFiles << "（未处理完，不计入失败）\n";
+        lines.push_back("已取消     " + std::to_string(result.cancelledFiles) +
+                        "（未处理完，不计入失败）");
     }
-    std::cout << "  数据总量 : " << formatByteSize(result.totalBytes) << " ("
-              << formatCount(result.totalBytes) << " 字节)\n";
-    std::cout << "  总耗时   : " << formatDuration(result.elapsed) << "\n";
+    lines.push_back("数据总量   " + formatByteSize(result.totalBytes) + " (" +
+                    formatCount(result.totalBytes) + " 字节)");
+    lines.push_back("总耗时     " + formatDuration(result.elapsed));
     if (result.elapsed > 0) {
-        std::cout << "  平均速度 : " << formatSpeed(static_cast<double>(result.totalBytes) /
-                                                    result.elapsed)
-                  << paint("（" + algoDisplayList(algos) + "）", Color::Gray) << "\n";
+        lines.push_back("平均速度   " +
+                        formatSpeed(static_cast<double>(result.totalBytes) / result.elapsed) +
+                        paint("（" + algoDisplayList(algos) + "）", Color::Gray));
     }
+    printPanel("统计", lines);
     if (result.cancelled) printWarning("任务已被用户取消，结果不完整");
     for (const std::wstring& error : result.errors) {
         printWarning("扫描：" + pathText(error));
@@ -200,6 +204,8 @@ void printUsage() {
         "      --no-handles      关闭句柄采样（只剩文件变更通知，无需权限但看不到进程）\n"
         "      --no-notify       关闭目录变更通知（只保留\"谁打开着文件\"）\n"
         "      --include-self    连 EHsc 自己产生的事件也记录\n"
+        "      --no-activity     只记录谁读写了它，不记录它被干了什么\n"
+        "      --no-digest       不做内容摘要比对（大文件/慢盘上更快）\n"
         "      --max-records <N> 最多保留多少条记录（默认 20000）\n"
         "      --elevate         直接请求管理员权限（弹 UAC），不询问\n"
         "      --no-elevate      不提权、不询问，以当前权限监听\n"
@@ -416,24 +422,26 @@ int cmdVerify(const Config& cfg, const std::wstring& manifestPath, const std::ws
         }
     }
 
-    printSectionTitle("校验统计");
-    std::cout << "  基准目录 : " << pathText(result.resolvedBase)
-              << "（用于解析清单中的相对路径）\n";
-    std::cout << "  条目总数 : " << formatCount(result.total) << "\n";
-    std::cout << "  通过     : " << paint(formatCount(result.passed), Color::Green) << "\n";
-    std::cout << "  不一致   : "
-              << paint(formatCount(result.failed), result.failed ? Color::Red : Color::Gray) << "\n";
-    std::cout << "  缺失     : "
-              << paint(formatCount(result.missing), result.missing ? Color::Yellow : Color::Gray)
-              << "\n";
-    std::cout << "  读取错误 : "
-              << paint(formatCount(result.errors), result.errors ? Color::Red : Color::Gray) << "\n";
-    if (result.skipped) std::cout << "  跳过     : " << result.skipped << "\n";
-    std::cout << "  已校验量 : " << formatByteSize(result.bytesChecked) << "\n";
-    std::cout << "  耗时     : " << formatDuration(result.elapsed) << "\n";
-    if (result.elapsed > 0) {
-        std::cout << "  平均速度 : "
-                  << formatSpeed(static_cast<double>(result.bytesChecked) / result.elapsed) << "\n";
+    {
+        std::vector<std::string> lines;
+        lines.push_back("基准目录   " + pathText(result.resolvedBase));
+        lines.push_back("条目总数   " + formatCount(result.total));
+        lines.push_back("通过       " + paint(formatCount(result.passed), Color::Green));
+        lines.push_back("不一致     " +
+                        paint(formatCount(result.failed), result.failed ? Color::Red : Color::Gray));
+        lines.push_back("缺失       " +
+                        paint(formatCount(result.missing), result.missing ? Color::Yellow : Color::Gray));
+        lines.push_back("读取错误   " +
+                        paint(formatCount(result.errors), result.errors ? Color::Red : Color::Gray));
+        if (result.skipped) lines.push_back("跳过       " + formatCount(result.skipped));
+        lines.push_back("已校验量   " + formatByteSize(result.bytesChecked));
+        lines.push_back("耗时       " + formatDuration(result.elapsed));
+        if (result.elapsed > 0) {
+            lines.push_back(
+                "平均速度   " +
+                formatSpeed(static_cast<double>(result.bytesChecked) / result.elapsed));
+        }
+        printPanel("校验统计", lines);
     }
 
     if (result.cancelled) {
@@ -492,12 +500,18 @@ int cmdCompare(const Config& cfg, const std::wstring& pathA, const std::wstring&
         return 3;
     }
 
-    printSectionTitle("比较结果");
-    std::cout << "  大小 : A = " << formatCount(result.sizeA) << " 字节, B = " << formatCount(result.sizeB)
-              << " 字节 → " << (result.sizeEqual ? paint("一致", Color::Green) : paint("不一致", Color::Red))
-              << "\n";
-    if (!quick) {
-        std::cout << "  逐字节比较 : " << formatByteSize(result.compared) << "\n";
+    {
+        std::vector<std::string> lines;
+        lines.push_back("A 大小     " + formatCount(result.sizeA) + " 字节");
+        lines.push_back("B 大小     " + formatCount(result.sizeB) + " 字节");
+        lines.push_back(std::string("大小一致性 ") +
+                        (result.sizeEqual ? paint("一致", Color::Green)
+                                          : paint("不一致", Color::Red)));
+        if (!quick) lines.push_back("逐字节比较 " + formatByteSize(result.compared));
+        lines.push_back(std::string("内容结论   ") +
+                        (result.contentEqual ? paint("★ 完全相同", Color::Green)
+                                             : paint("✘ 存在差异", Color::Red)));
+        printPanel("比较结果", lines);
     }
 
     if (withHash && !result.digestsA.empty()) {
@@ -643,6 +657,18 @@ std::string describeChangeRecord(const ChangeRecord& record) {
     return line;
 }
 
+// 活动时间线的一行："这个文件被干了什么"
+std::string describeActivityRecord(const ActivityRecord& record) {
+    std::string line;
+    line += paint("[" + formatUnixTime(record.timeMs / 1000) + "] ", Color::Gray);
+    const Color color = record.kind == ActivityKind::Deleted ? Color::Red
+                        : (record.kind == ActivityKind::Created ? Color::Green : Color::Yellow);
+    line += paint(padToWidth(activityKindDisplay(record.kind), 12), color);
+    line += wideToUtf8(baseName(record.path));
+    line += paint("  " + describeActivityBrief(record), Color::Gray);
+    return line;
+}
+
 }  // namespace
 
 // 提权询问的等待秒数：默认 30 秒，0 表示一直等；可用环境变量 EHSC_ELEVATE_TIMEOUT 调整
@@ -675,7 +701,9 @@ int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
         resolvedTargets.push_back(full.empty() ? raw : full);
     }
 
-    if (!isProcessElevated() && options.elevate != ElevateMode::Never) {
+    // 只有需要"归因到进程"（句柄采样）时才值得打断用户去提权；
+    // 纯活动审计（--no-handles）不需要管理员权限。
+    if (!isProcessElevated() && options.elevate != ElevateMode::Never && options.pollHandles) {
         bool attempt = options.elevate == ElevateMode::Force;
         if (options.elevate == ElevateMode::Ask) {
             // 能问就问：控制台、管道里已有数据、或调用方确认这是交互流程（主菜单）。
@@ -776,6 +804,8 @@ int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
     engine.maxRecords = options.maxRecords;
     engine.filters = options.filters;
     engine.pollIntervalMs = 400;
+    engine.trackActivity = options.trackActivity;
+    engine.digestContent = options.digestContent;
 
     FileActivityMonitor monitor(resolvedTargets, engine);
     std::wstring err;
@@ -829,9 +859,13 @@ int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
 
     size_t shownAccess = 0;
     size_t shownChange = 0;
+    size_t shownActivity = 0;
     bool interrupted = false;
     while (true) {
-        if (!control.checkpoint()) {
+        // 注意：这里用非阻塞的 cancelled()，不用 checkpoint()。
+        // 监听是"纯观察"，暂停没有意义；而 checkpoint() 在暂停状态下会一直阻塞，
+        // 万一被误暂停（例如控制台里有残留的空格键），监听就会毫无提示地永久卡住。
+        if (control.cancelled()) {
             interrupted = true;
             break;
         }
@@ -845,7 +879,8 @@ int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
         }
         std::vector<AccessRecord> newAccess;
         std::vector<ChangeRecord> newChange;
-        monitor.drain(newAccess, newChange);
+        std::vector<ActivityRecord> newActivity;
+        monitor.drain(newAccess, newChange, newActivity);
         // 只打印"首次出现"的访问记录（samples==1 即新记录），持续占用不再每轮刷屏，
         // 完整明细在结束后的结果区统一给出。
         for (const AccessRecord& record : newAccess) {
@@ -856,6 +891,11 @@ int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
         for (const ChangeRecord& record : newChange) {
             progress.log(describeChangeRecord(record));
             ++shownChange;
+        }
+        // "这个文件被干了什么"：内容/属性/存亡的每一次变化都实时打一行
+        for (const ActivityRecord& record : newActivity) {
+            progress.log(describeActivityRecord(record));
+            ++shownActivity;
         }
 
         const int64_t nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -892,8 +932,18 @@ int cmdWatch(const Config& cfg, const std::vector<std::wstring>& targets,
               << " 个文件）\n";
     std::cout << "  变更事件 : " << paint(std::to_string(result.changes.size()), Color::Magenta)
               << " 条\n";
+    std::cout << "  活动记录 : " << paint(std::to_string(result.activities.size()), Color::Yellow)
+              << " 条（\"这个文件被干了什么\"，其中 "
+              << result.stats.activitiesWithProcess << " 条已归因到具体进程）\n";
     std::cout << "  监听时长 : " << formatDuration(result.elapsed) << "\n";
     (void)quietMode;
+
+    if (!result.activities.empty()) {
+        std::cout << "\n" << paint("── 文件活动时间线（干了什么） ──", Color::Bold) << "\n";
+        for (const ActivityRecord& record : result.activities) {
+            std::cout << "  " << describeActivityRecord(record) << "\n";
+        }
+    }
 
     if (!result.accesses.empty()) {
         std::cout << "\n" << paint("── 进程访问明细 ──", Color::Bold) << "\n";
@@ -973,6 +1023,8 @@ struct ParsedArgs {
     bool     watchHandles = true;
     bool     watchNotify = true;
     bool     watchSelf = false;
+    bool     watchDigest = true;
+    bool     watchActivity = true;
     ElevateMode watchElevate = ElevateMode::Ask;
     bool     watchElevatedChild = false;
     bool help = false;
@@ -1310,6 +1362,8 @@ int runCommandLine(int argc, wchar_t** argv) {
         watch.pollHandles = args.watchHandles;
         watch.notifyChanges = args.watchNotify;
         watch.includeSelf = args.watchSelf;
+        watch.trackActivity = args.watchActivity;
+        watch.digestContent = args.watchDigest;
         watch.onlyPid = args.watchPid;
         watch.maxRecords = args.watchMaxRecords;
         watch.filters = parseFilters(cfg.filters);

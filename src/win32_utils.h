@@ -57,9 +57,22 @@ int pollKey();
 // ------------------------------------------------------ 控制台鼠标支持 --
 // 控制台输入事件：键盘按键、鼠标左键单击，或什么都没有。
 enum class ConsoleEventKind { None, Key, MouseClick };
+
+// 菜单需要的虚拟键码（只暴露用得到的几个，避免界面代码去包含 <windows.h>）
+enum ConsoleVirtualKey : int {
+    ConsoleVkLeft  = 0x25,
+    ConsoleVkUp    = 0x26,
+    ConsoleVkRight = 0x27,
+    ConsoleVkDown  = 0x28,
+    ConsoleVkHome  = 0x24,
+    ConsoleVkEnd   = 0x23,
+    ConsoleVkPrior = 0x21,   // PageUp
+    ConsoleVkNext  = 0x22,   // PageDown
+};
 struct ConsoleEvent {
     ConsoleEventKind kind = ConsoleEventKind::None;
     int              key = 0;    // kind == Key：可打印字符的 ASCII（Esc=27，回车=13）
+    int              virtualKey = 0;   // kind == Key：虚拟键码（VK_UP / VK_DOWN / VK_HOME …）
     int              row = 0;    // kind == MouseClick：点击位置（控制台缓冲区坐标）
     int              column = 0;
 };
